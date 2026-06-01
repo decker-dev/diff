@@ -79,6 +79,68 @@ fn main() {
         Ok(msg) => println!("  ✓ {msg}"),
         Err(e) => println!("  ✗ FALLO: {e}"),
     }
+
+    println!("\n  -- M5: ramas (crear/checkout/merge FF/borrar) --");
+    match test_branch_ops() {
+        Ok(msg) => println!("  ✓ {msg}"),
+        Err(e) => println!("  ✗ FALLO: {e}"),
+    }
+}
+
+/// Verifica el ciclo de ramas: crear, checkout, commit, merge fast-forward, borrar.
+fn test_branch_ops() -> Result<String, String> {
+    let dir = std::env::temp_dir().join("rebased-rs-branch");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.to_string_lossy().to_string();
+    let git = |args: &[&str]| {
+        Command::new("git").arg("-C").arg(&path).args(args).output().ok();
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@rebased.rs"]);
+    git(&["config", "user.name", "t"]);
+
+    fs::write(dir.join("a.txt"), "uno\n").map_err(|e| e.to_string())?;
+    let repo = git_core::Repo::open(&path).map_err(es)?;
+    repo.stage("a.txt").map_err(es)?;
+    repo.commit("c1").map_err(es)?;
+
+    // rama por defecto (main/master)
+    let default = repo
+        .branches()
+        .map_err(es)?
+        .into_iter()
+        .find(|b| b.is_head)
+        .map(|b| b.name)
+        .ok_or("sin rama HEAD")?;
+
+    repo.create_branch("feat").map_err(es)?;
+    let names: Vec<String> = repo.branches().map_err(es)?.into_iter().map(|b| b.name).collect();
+    if !names.iter().any(|n| n == "feat") {
+        return Err(format!("create_branch: ramas={names:?}"));
+    }
+
+    repo.checkout_branch("feat").map_err(es)?;
+    fs::write(dir.join("b.txt"), "rama\n").map_err(|e| e.to_string())?;
+    repo.stage("b.txt").map_err(es)?;
+    repo.commit("c2 en feat").map_err(es)?;
+
+    repo.checkout_branch(&default).map_err(es)?;
+    let outcome = repo.merge_branch("feat").map_err(es)?;
+    if !matches!(outcome, git_core::MergeOutcome::FastForward(_)) {
+        return Err(format!("merge esperaba FastForward, dio {outcome:?}"));
+    }
+    if !dir.join("b.txt").exists() {
+        return Err("tras merge FF, falta b.txt".into());
+    }
+    repo.delete_branch("feat").map_err(es)?;
+
+    Ok(format!("rama default={default}, feat creada/mergeada/borrada OK"))
+}
+
+/// Helper: git_core::Error → String (fn item, reutilizable en map_err).
+fn es(e: git_core::Error) -> String {
+    e.to_string()
 }
 
 /// Verifica amend, cherry-pick y revert en un repo temporal.

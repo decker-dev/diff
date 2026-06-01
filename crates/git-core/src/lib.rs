@@ -52,6 +52,23 @@ pub struct StatusEntry {
     pub staged: bool,
 }
 
+/// Una rama local.
+#[derive(Debug, Clone)]
+pub struct BranchInfo {
+    pub name: String,
+    pub is_head: bool,
+    pub upstream: Option<String>,
+}
+
+/// Resultado de fusionar una rama.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    UpToDate,
+    FastForward(String),
+    Merged(String),
+    Conflicts,
+}
+
 impl Repo {
     /// Abre el repo que contiene `path` (descubre el `.git` hacia arriba).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
@@ -181,6 +198,100 @@ impl Repo {
         let mut cb = git2::build::CheckoutBuilder::new();
         cb.path(path).force();
         self.inner.checkout_index(None, Some(&mut cb))
+    }
+
+    // ---- Ramas (área Ramas) ----
+
+    /// Lista las ramas locales (marca la actual).
+    pub fn branches(&self) -> Result<Vec<BranchInfo>, Error> {
+        let mut out = Vec::new();
+        for b in self.inner.branches(Some(git2::BranchType::Local))? {
+            let (branch, _) = b?;
+            let is_head = branch.is_head();
+            let name = branch.name()?.unwrap_or("").to_string();
+            let upstream = branch
+                .upstream()
+                .ok()
+                .and_then(|u| u.name().ok().flatten().map(str::to_string));
+            out.push(BranchInfo { name, is_head, upstream });
+        }
+        Ok(out)
+    }
+
+    /// Crea una rama nueva en HEAD.
+    pub fn create_branch(&self, name: &str) -> Result<(), Error> {
+        let head = self.inner.head()?.peel_to_commit()?;
+        self.inner.branch(name, &head, false)?;
+        Ok(())
+    }
+
+    /// Cambia a la rama `name` (checkout seguro).
+    pub fn checkout_branch(&self, name: &str) -> Result<(), Error> {
+        let refname = format!("refs/heads/{name}");
+        let obj = self.inner.revparse_single(&refname)?;
+        self.inner.checkout_tree(&obj, None)?;
+        self.inner.set_head(&refname)?;
+        Ok(())
+    }
+
+    /// Borra una rama local.
+    pub fn delete_branch(&self, name: &str) -> Result<(), Error> {
+        self.inner
+            .find_branch(name, git2::BranchType::Local)?
+            .delete()
+    }
+
+    /// Fusiona `name` en la rama actual. Maneja fast-forward y merge normal.
+    pub fn merge_branch(&self, name: &str) -> Result<MergeOutcome, Error> {
+        let their_commit = self
+            .inner
+            .find_branch(name, git2::BranchType::Local)?
+            .get()
+            .peel_to_commit()?;
+        let annotated = self.inner.find_annotated_commit(their_commit.id())?;
+        let (analysis, _) = self.inner.merge_analysis(&[&annotated])?;
+
+        if analysis.is_up_to_date() {
+            return Ok(MergeOutcome::UpToDate);
+        }
+        if analysis.is_fast_forward() {
+            let mut head_ref = self.inner.head()?;
+            head_ref.set_target(their_commit.id(), "fast-forward")?;
+            self.inner.set_head(head_ref.name().unwrap_or("HEAD"))?;
+            let mut cb = git2::build::CheckoutBuilder::new();
+            cb.force();
+            self.inner.checkout_head(Some(&mut cb))?;
+            return Ok(MergeOutcome::FastForward(their_commit.id().to_string()));
+        }
+
+        self.inner.merge(&[&annotated], None, None)?;
+        if self.inner.index()?.has_conflicts() {
+            return Ok(MergeOutcome::Conflicts);
+        }
+        let tree = self.inner.find_tree(self.inner.index()?.write_tree()?)?;
+        let sig = self.inner.signature()?;
+        let head_commit = self.inner.head()?.peel_to_commit()?;
+        let oid = self.inner.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            &format!("Merge branch '{name}'"),
+            &tree,
+            &[&head_commit, &their_commit],
+        )?;
+        self.inner.cleanup_state()?;
+        Ok(MergeOutcome::Merged(oid.to_string()))
+    }
+
+    /// Lista los worktrees del repo.
+    pub fn worktrees(&self) -> Result<Vec<String>, Error> {
+        Ok(self
+            .inner
+            .worktrees()?
+            .iter()
+            .flatten()
+            .map(str::to_string)
+            .collect())
     }
 }
 
