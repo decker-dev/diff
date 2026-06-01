@@ -6,6 +6,7 @@
 use git_core::blame::BlameLine;
 use git_core::diff::{FileDiff, LineOrigin};
 use git_core::graph::{compute_graph, RowGraph};
+use git_core::rebase::{RebaseAction, RebaseResult, RebaseStep};
 use git_core::{BranchInfo, CommitInfo, StatusEntry};
 use gpui::{
     div, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds, Context, Entity,
@@ -47,6 +48,19 @@ enum ViewMode {
     Log,
     Changes,
     Branches,
+}
+
+/// Una fila del editor de rebase interactivo.
+struct PlanRow {
+    id: String,
+    summary: String,
+    action: RebaseAction,
+}
+
+/// Plan de rebase interactivo en edición.
+struct RebasePlan {
+    base: String,
+    steps: Vec<PlanRow>,
 }
 
 /// Colores de rama del graph (se ciclan por índice de lane).
@@ -126,6 +140,9 @@ struct RebasedApp {
     branches: Vec<BranchInfo>,
     new_branch: String,
     branch_focus: FocusHandle,
+
+    // ---- Rebase interactivo (M6) ----
+    rebase: Option<RebasePlan>,
 }
 
 impl RebasedApp {
@@ -404,6 +421,87 @@ impl RebasedApp {
         });
         self.refresh_status(cx);
     }
+
+    // ---- Rebase interactivo (M6) ----
+    /// Abre el editor de rebase: reaplica los commits desde el padre de `ix` hasta HEAD.
+    fn start_rebase(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(commit) = self.commits.get(ix) else { return };
+        let Some(base) = commit.parents.first().cloned() else {
+            self.op_msg = Some("No se puede rebasar sobre el commit raíz".into());
+            cx.notify();
+            return;
+        };
+        let steps = self.commits[0..=ix]
+            .iter()
+            .rev()
+            .map(|c| PlanRow {
+                id: c.id.clone(),
+                summary: c.summary.clone(),
+                action: RebaseAction::Pick,
+            })
+            .collect();
+        self.rebase = Some(RebasePlan { base, steps });
+        cx.notify();
+    }
+
+    /// Cicla la acción de un paso: Pick → Squash → Fixup → Drop → Pick.
+    fn rebase_cycle(&mut self, i: usize, cx: &mut Context<Self>) {
+        if let Some(p) = &mut self.rebase {
+            if let Some(row) = p.steps.get_mut(i) {
+                row.action = match row.action {
+                    RebaseAction::Pick => RebaseAction::Squash,
+                    RebaseAction::Squash => RebaseAction::Fixup,
+                    RebaseAction::Fixup => RebaseAction::Drop,
+                    _ => RebaseAction::Pick,
+                };
+            }
+        }
+        cx.notify();
+    }
+
+    /// Reordena un paso del plan.
+    fn rebase_move(&mut self, i: usize, up: bool, cx: &mut Context<Self>) {
+        if let Some(p) = &mut self.rebase {
+            let j = if up {
+                i.checked_sub(1)
+            } else if i + 1 < p.steps.len() {
+                Some(i + 1)
+            } else {
+                None
+            };
+            if let Some(j) = j {
+                p.steps.swap(i, j);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Ejecuta el plan de rebase.
+    fn apply_rebase(&mut self, cx: &mut Context<Self>) {
+        let Some(plan) = self.rebase.take() else { return };
+        let steps: Vec<RebaseStep> = plan
+            .steps
+            .iter()
+            .map(|r| RebaseStep {
+                commit: r.id.clone(),
+                action: r.action.clone(),
+            })
+            .collect();
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|repo| repo.rebase_interactive(&plan.base, &steps));
+        self.op_msg = Some(match r {
+            Ok(RebaseResult::Done(id)) => format!("✓ rebase OK → {}", short(&id)),
+            Ok(RebaseResult::Conflict(c)) => format!("✗ conflicto al aplicar {}", short(&c)),
+            Err(e) => format!("✗ {e}"),
+        });
+        self.reload_log();
+        cx.notify();
+    }
+
+    fn cancel_rebase(&mut self, cx: &mut Context<Self>) {
+        self.rebase = None;
+        cx.notify();
+    }
 }
 
 /// Aplica una tecla a un buffer de texto (input minimalista).
@@ -440,10 +538,14 @@ fn short(id: &str) -> String {
 impl Render for RebasedApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let toolbar = self.render_toolbar(cx);
-        let body = match self.view {
-            ViewMode::Log => self.render_log(cx),
-            ViewMode::Changes => self.render_changes(cx),
-            ViewMode::Branches => self.render_branches(cx),
+        let body = if self.rebase.is_some() {
+            self.render_rebase_editor(cx)
+        } else {
+            match self.view {
+                ViewMode::Log => self.render_log(cx),
+                ViewMode::Changes => self.render_changes(cx),
+                ViewMode::Branches => self.render_branches(cx),
+            }
         };
         let toast = self.op_msg.clone().map(|m| {
             div()
@@ -788,6 +890,113 @@ impl RebasedApp {
 
         div().flex().flex_col().flex_1().min_h_0().child(list).child(create).into_any_element()
     }
+
+    /// Editor visual de rebase interactivo (M6).
+    fn render_rebase_editor(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        let plan = match &self.rebase {
+            Some(p) => p,
+            None => return div().into_any_element(),
+        };
+        let mut list = div()
+            .id("rebase-list")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll();
+        for (i, row) in plan.steps.iter().enumerate() {
+            let (e1, e2, e3) = (e.clone(), e.clone(), e.clone());
+            let dropped = matches!(row.action, RebaseAction::Drop);
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .h(px(26.0))
+                    .hover(|s| s.bg(color::hover()))
+                    .child(btn(&format!("ract-{i}"), action_label(&row.action), move |app| {
+                        e1.update(app, |t, cx| t.rebase_cycle(i, cx));
+                    }))
+                    .child(div().flex_none().w(px(56.0)).font_family("Menlo").text_color(color::accent()).child(short(&row.id)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_color(if dropped { color::dim() } else { color::fg() })
+                            .child(row.summary.clone()),
+                    )
+                    .child(btn(&format!("rup-{i}"), "↑", move |app| {
+                        e2.update(app, |t, cx| t.rebase_move(i, true, cx));
+                    }))
+                    .child(btn(&format!("rdn-{i}"), "↓", move |app| {
+                        e3.update(app, |t, cx| t.rebase_move(i, false, cx));
+                    })),
+            );
+        }
+        let footer = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .p_2()
+            .border_t_1()
+            .border_color(color::line())
+            .bg(color::panel())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_color(color::dim())
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(format!(
+                        "base {} · {} pasos · clic en la acción cicla pick→squash→fixup→drop",
+                        short(&plan.base),
+                        plan.steps.len()
+                    )),
+            )
+            .child(btn("rb-apply", "Aplicar rebase", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.apply_rebase(cx)); } }))
+            .child(btn("rb-cancel", "Cancelar", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.cancel_rebase(cx)); } }));
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .bg(color::panel())
+                    .border_b_1()
+                    .border_color(color::line())
+                    .text_color(color::accent())
+                    .child("Rebase interactivo 🎯 — arriba = más antiguo"),
+            )
+            .child(list)
+            .child(footer)
+            .into_any_element()
+    }
+}
+
+/// Etiqueta corta de una acción de rebase.
+fn action_label(a: &RebaseAction) -> &'static str {
+    match a {
+        RebaseAction::Pick => "PICK",
+        RebaseAction::Reword(_) => "REWORD",
+        RebaseAction::Squash => "SQUASH",
+        RebaseAction::Fixup => "FIXUP",
+        RebaseAction::Drop => "DROP",
+    }
 }
 
 /// Botón pequeño de la UI.
@@ -934,6 +1143,12 @@ impl RebasedApp {
                     .text_sm()
                     .child(div().font_family("Menlo").text_color(color::accent()).child(short))
                     .child(div().flex_1().min_w_0().whitespace_nowrap().text_ellipsis().child(c.summary.clone()))
+                    .child(btn("rb-from", "⤵ rebase i.", {
+                        let e = cx.entity();
+                        move |app| {
+                            e.update(app, |t, cx| t.start_rebase(ix, cx));
+                        }
+                    }))
             }
             None => div()
                 .w_full()
@@ -1228,6 +1443,7 @@ fn main() {
                     branches: Vec::new(),
                     new_branch: String::new(),
                     branch_focus: cx.focus_handle(),
+                    rebase: None,
                 })
             },
         )
