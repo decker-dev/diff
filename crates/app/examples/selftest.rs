@@ -73,6 +73,63 @@ fn main() {
         Ok(msg) => println!("  ✓ {msg}"),
         Err(e) => println!("  ✗ FALLO: {e}"),
     }
+
+    println!("\n  -- M4: amend / cherry-pick / revert --");
+    match test_commit_ops() {
+        Ok(msg) => println!("  ✓ {msg}"),
+        Err(e) => println!("  ✗ FALLO: {e}"),
+    }
+}
+
+/// Verifica amend, cherry-pick y revert en un repo temporal.
+fn test_commit_ops() -> Result<String, String> {
+    let dir = std::env::temp_dir().join("rebased-rs-ops");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.to_string_lossy().to_string();
+    let git = |args: &[&str]| {
+        Command::new("git").arg("-C").arg(&path).args(args).output().ok();
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@rebased.rs"]);
+    git(&["config", "user.name", "t"]);
+
+    let e = |r: Result<(), git_core::Error>| r.map_err(|e| e.to_string());
+    let e2 = |r: Result<String, git_core::Error>| r.map_err(|e| e.to_string());
+
+    fs::write(dir.join("a.txt"), "uno\n").map_err(|x| x.to_string())?;
+    let repo = git_core::Repo::open(&path).map_err(|x| x.to_string())?;
+    e(repo.stage("a.txt"))?;
+    e2(repo.commit("c1"))?;
+
+    // amend: cambiar el mensaje del HEAD
+    e2(repo.amend("c1 enmendado"))?;
+    let log = git_core::gix_log(&path, 5).map_err(|x| x.to_string())?;
+    if log[0].summary != "c1 enmendado" {
+        return Err(format!("amend: summary='{}'", log[0].summary));
+    }
+
+    // cherry-pick: commit en rama feat, volver, cherry-pick ese commit
+    git(&["checkout", "-q", "-b", "feat"]);
+    fs::write(dir.join("b.txt"), "rama\n").map_err(|x| x.to_string())?;
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "en feat"]);
+    let feat_head = git_core::gix_log(&path, 1).map_err(|x| x.to_string())?[0].id.clone();
+    git(&["checkout", "-q", "-"]); // volver a la rama anterior
+    e(repo.cherry_pick(&feat_head))?;
+    if !dir.join("b.txt").exists() {
+        return Err("cherry-pick no trajo b.txt".into());
+    }
+    e2(repo.commit("cherry de feat"))?;
+
+    // revert: revertir el último commit → b.txt desaparece
+    let last = git_core::gix_log(&path, 1).map_err(|x| x.to_string())?[0].id.clone();
+    e(repo.revert_commit(&last))?;
+    if dir.join("b.txt").exists() {
+        return Err("revert no quitó b.txt".into());
+    }
+
+    Ok("amend + cherry-pick + revert OK".into())
 }
 
 /// Crea un repo temporal, hace stage+commit con git-core y verifica con el log.

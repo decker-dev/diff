@@ -154,6 +154,34 @@ impl Repo {
         };
         Ok(oid.to_string())
     }
+
+    /// Enmienda (amend) el commit HEAD con el index actual y un nuevo mensaje.
+    pub fn amend(&self, message: &str) -> Result<String, Error> {
+        let head = self.inner.head()?.peel_to_commit()?;
+        let mut index = self.inner.index()?;
+        let tree = self.inner.find_tree(index.write_tree()?)?;
+        let oid = head.amend(Some("HEAD"), None, None, None, Some(message), Some(&tree))?;
+        Ok(oid.to_string())
+    }
+
+    /// Revierte un commit en el working tree + index (como `git revert --no-commit`).
+    pub fn revert_commit(&self, id: &str) -> Result<(), Error> {
+        let commit = self.inner.find_commit(git2::Oid::from_str(id)?)?;
+        self.inner.revert(&commit, None)
+    }
+
+    /// Aplica un commit (cherry-pick) en el working tree + index.
+    pub fn cherry_pick(&self, id: &str) -> Result<(), Error> {
+        let commit = self.inner.find_commit(git2::Oid::from_str(id)?)?;
+        self.inner.cherrypick(&commit, None)
+    }
+
+    /// Descarta los cambios no-staged de un archivo (rollback al estado del index).
+    pub fn discard(&self, path: &str) -> Result<(), Error> {
+        let mut cb = git2::build::CheckoutBuilder::new();
+        cb.path(path).force();
+        self.inner.checkout_index(None, Some(&mut cb))
+    }
 }
 
 /// `log` vía **gitoxide (gix)** — el motor candidato para las rutas calientes.
