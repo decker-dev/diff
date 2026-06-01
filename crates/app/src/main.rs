@@ -9,14 +9,15 @@ use git_core::graph::{compute_graph, RowGraph};
 use git_core::CommitInfo;
 use gpui::{
     div, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds, Context, Entity, Rgba,
-    Window, WindowBounds, WindowOptions,
+    SharedString, Window, WindowBounds, WindowOptions,
 };
 
 const ROW_H: f32 = 24.0;
 const LANE_W: f32 = 14.0;
 const DOT: f32 = 8.0;
 const MAX_LANES: usize = 14;
-const DIFF_LINE_BUDGET: usize = 4000;
+/// Altura de fila en los paneles de diff/blame (monospace, virtualizados).
+const DIFF_ROW_H: f32 = 18.0;
 
 /// Paleta estilo IntelliJ "New UI" (dark).
 mod color {
@@ -54,6 +55,34 @@ struct BlameView {
     loading: bool,
 }
 
+/// Fila plana del diff, para virtualizar con `uniform_list` (todas ~misma altura).
+enum DiffRow {
+    /// Cabecera de archivo (clicable → blame). `String` = ruta; el resto = etiqueta.
+    File(String, String),
+    Hunk(String),
+    Line(LineOrigin, String),
+}
+
+/// Aplana el diff (archivos→hunks→líneas) en filas para la lista virtualizada.
+fn build_diff_rows(diff: &[FileDiff]) -> Vec<DiffRow> {
+    let mut rows = Vec::new();
+    for f in diff {
+        let (add, del) = f.line_stats();
+        let bin = if f.binary { "  [binario]" } else { "" };
+        rows.push(DiffRow::File(
+            f.path.clone(),
+            format!("{}   +{add} −{del}{bin}   ⟶ blame", f.path),
+        ));
+        for h in &f.hunks {
+            rows.push(DiffRow::Hunk(h.header.clone()));
+            for l in &h.lines {
+                rows.push(DiffRow::Line(l.origin, l.content.clone()));
+            }
+        }
+    }
+    rows
+}
+
 struct RebasedApp {
     repo_path: String,
     commits: Vec<CommitInfo>,
@@ -62,6 +91,8 @@ struct RebasedApp {
     error: Option<String>,
     selected: Option<usize>,
     diff: Vec<FileDiff>,
+    /// Diff aplanado para la lista virtualizada (deriva de `diff`).
+    diff_rows: Vec<DiffRow>,
     diff_error: Option<String>,
     /// Si está `Some`, el panel inferior muestra blame en vez del diff.
     blame: Option<BlameView>,
@@ -78,11 +109,13 @@ impl RebasedApp {
         let id = self.commits[ix].id.clone();
         match git_core::diff::commit_diff(&self.repo_path, &id) {
             Ok(files) => {
+                self.diff_rows = build_diff_rows(&files);
                 self.diff = files;
                 self.diff_error = None;
             }
             Err(e) => {
                 self.diff.clear();
+                self.diff_rows.clear();
                 self.diff_error = Some(e);
             }
         }
@@ -190,18 +223,81 @@ impl Render for RebasedApp {
             .text_color(color::fg())
             .child(header)
             .child(log)
-            .child(self.render_diff_panel(cx.entity()))
+            .child(self.render_diff_panel(cx))
     }
 }
 
 impl RebasedApp {
     /// Panel inferior: diff del commit, o blame de un archivo si está activo.
-    fn render_diff_panel(&self, entity: Entity<RebasedApp>) -> gpui::AnyElement {
-        // Modo blame: el panel muestra la anotación del archivo elegido.
+    /// Ambos listados están VIRTUALIZADOS (uniform_list) → render y scroll fluidos
+    /// aunque el archivo tenga decenas de miles de líneas.
+    fn render_diff_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let container = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .h(px(340.0))
+            .border_t_1()
+            .border_color(color::line())
+            .bg(color::bg());
+
+        // ---- Modo blame ----
         if let Some(bv) = &self.blame {
-            return self.render_blame(bv, entity).into_any_element();
+            let head = {
+                let e = cx.entity();
+                let back = div()
+                    .id("blame-back")
+                    .px_2()
+                    .cursor_pointer()
+                    .text_color(color::accent())
+                    .hover(|s| s.bg(color::hover()))
+                    .on_click(move |_, _, app| e.update(app, |t, cx| t.clear_blame(cx)))
+                    .child("← diff");
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .bg(color::panel())
+                    .text_sm()
+                    .child(back)
+                    .child(div().font_family("Menlo").child(bv.file.clone()))
+                    .child(div().text_color(color::dim()).child("· blame"))
+            };
+
+            let body = if bv.loading {
+                div().flex_1().p_3().text_color(color::dim()).child("Cargando blame…").into_any_element()
+            } else if let Some(err) = &bv.error {
+                div().flex_1().p_3().text_color(color::err()).child(err.clone()).into_any_element()
+            } else {
+                let n = bv.lines.len();
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .font_family("Menlo")
+                    .text_xs()
+                    .child(
+                        uniform_list(
+                            "blame-rows",
+                            n,
+                            cx.processor(|this, range: std::ops::Range<usize>, _w, _cx| {
+                                let lines = this.blame.as_ref().map(|b| &b.lines);
+                                range
+                                    .filter_map(|i| lines.and_then(|l| l.get(i)).map(blame_line_el))
+                                    .collect::<Vec<_>>()
+                            }),
+                        )
+                        .size_full(),
+                    )
+                    .into_any_element()
+            };
+            return container.child(head).child(body).into_any_element();
         }
 
+        // ---- Modo diff ----
         let head = match self.selected {
             Some(ix) => {
                 let c = &self.commits[ix];
@@ -228,167 +324,120 @@ impl RebasedApp {
                 .child("Selecciona un commit para ver su diff"),
         };
 
-        let content = if let Some(err) = &self.diff_error {
-            div().p_3().text_color(color::err()).child(err.clone()).into_any_element()
+        let body = if let Some(err) = &self.diff_error {
+            div().flex_1().p_3().text_color(color::err()).child(err.clone()).into_any_element()
+        } else if self.diff_rows.is_empty() {
+            div().flex_1().p_3().text_color(color::dim()).child("Sin cambios en este commit").into_any_element()
         } else {
-            let mut body = div()
-                .id("diff-body")
-                .flex()
-                .flex_col()
+            let entity = cx.entity();
+            let n = self.diff_rows.len();
+            div()
                 .flex_1()
                 .min_h_0()
-                .w_full()
-                .overflow_y_scroll()
                 .font_family("Menlo")
-                .text_xs();
-            let mut budget = DIFF_LINE_BUDGET;
-            for (i, f) in self.diff.iter().enumerate() {
-                let (add, del) = f.line_stats();
-                let e = entity.clone();
-                let fname = f.path.clone();
-                body = body.child(
-                    div()
-                        .id(i)
-                        .w_full()
-                        .px_3()
-                        .py_1()
-                        .bg(color::panel())
-                        .text_color(color::fg())
-                        .cursor_pointer()
-                        .hover(|s| s.bg(color::hover()))
-                        .on_click(move |_, _, app| {
-                            let f = fname.clone();
-                            e.update(app, |t, cx| t.show_blame(f, cx));
-                        })
-                        .child(format!("{}   +{add} −{del}{}   ⟶ blame", f.path, if f.binary { "  [binario]" } else { "" })),
-                );
-                for h in &f.hunks {
-                    body = body.child(div().w_full().px_3().text_color(color::dim()).child(h.header.clone()));
-                    for l in &h.lines {
-                        if budget == 0 {
-                            break;
-                        }
-                        budget -= 1;
-                        let (fg, bg, sign) = match l.origin {
-                            LineOrigin::Add => (color::add_fg(), color::add_bg(), "+"),
-                            LineOrigin::Del => (color::del_fg(), color::del_bg(), "−"),
-                            LineOrigin::Context => (color::fg(), color::bg(), " "),
-                        };
-                        body = body.child(
-                            div()
-                                .w_full()
-                                .px_3()
-                                .bg(bg)
-                                .text_color(fg)
-                                .child(format!("{sign} {}", l.content)),
-                        );
-                    }
-                }
-            }
-            if budget == 0 {
-                body = body.child(div().px_3().py_1().text_color(color::dim()).child("… diff truncado"));
-            }
-            body.into_any_element()
+                .text_xs()
+                .child(
+                    uniform_list(
+                        "diff-rows",
+                        n,
+                        cx.processor(move |this, range: std::ops::Range<usize>, _w, _cx| {
+                            range
+                                .filter_map(|i| this.diff_rows.get(i).map(|r| diff_row_el(r, &entity)))
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .size_full(),
+                )
+                .into_any_element()
         };
 
-        div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .h(px(340.0))
-            .border_t_1()
-            .border_color(color::line())
-            .bg(color::bg())
-            .child(head)
-            .child(content)
-            .into_any_element()
+        container.child(head).child(body).into_any_element()
     }
+}
 
-    /// Panel de blame: cabecera con "← diff" + líneas anotadas (línea · commit · autor · texto).
-    fn render_blame(&self, bv: &BlameView, entity: Entity<RebasedApp>) -> impl IntoElement {
-        let back = {
+/// Una fila del diff virtualizado: cabecera de archivo (clicable→blame), hunk, o línea ±.
+fn diff_row_el(row: &DiffRow, entity: &Entity<RebasedApp>) -> gpui::AnyElement {
+    match row {
+        DiffRow::File(path, label) => {
             let e = entity.clone();
+            let p = path.clone();
             div()
-                .id("blame-back")
-                .px_2()
+                .id(SharedString::from(format!("f:{path}")))
+                .flex()
+                .items_center()
+                .h(px(DIFF_ROW_H))
+                .w_full()
+                .px_3()
+                .bg(color::panel())
+                .text_color(color::fg())
                 .cursor_pointer()
-                .text_color(color::accent())
                 .hover(|s| s.bg(color::hover()))
-                .on_click(move |_, _, app| e.update(app, |t, cx| t.clear_blame(cx)))
-                .child("← diff")
-        };
-        let head = div()
+                .on_click(move |_, _, app| {
+                    let p = p.clone();
+                    e.update(app, |t, cx| t.show_blame(p, cx));
+                })
+                .child(label.clone())
+                .into_any_element()
+        }
+        DiffRow::Hunk(header) => div()
             .flex()
-            .flex_row()
             .items_center()
-            .gap_2()
+            .h(px(DIFF_ROW_H))
             .w_full()
             .px_3()
-            .py_1()
-            .bg(color::panel())
-            .text_sm()
-            .child(back)
-            .child(div().font_family("Menlo").child(bv.file.clone()))
-            .child(div().text_color(color::dim()).child("· blame"));
-
-        let content = if bv.loading {
-            div().p_3().text_color(color::dim()).child("Cargando blame…").into_any_element()
-        } else if let Some(err) = &bv.error {
-            div().p_3().text_color(color::err()).child(err.clone()).into_any_element()
-        } else {
-            let mut b = div()
-                .id("blame-body")
+            .text_color(color::dim())
+            .child(header.clone())
+            .into_any_element(),
+        DiffRow::Line(origin, content) => {
+            let (fg, bg, sign) = match origin {
+                LineOrigin::Add => (color::add_fg(), color::add_bg(), "+"),
+                LineOrigin::Del => (color::del_fg(), color::del_bg(), "−"),
+                LineOrigin::Context => (color::fg(), color::bg(), " "),
+            };
+            div()
                 .flex()
-                .flex_col()
-                .flex_1()
-                .min_h_0()
+                .items_center()
+                .h(px(DIFF_ROW_H))
                 .w_full()
-                .overflow_y_scroll()
-                .font_family("Menlo")
-                .text_xs();
-            for l in bv.lines.iter().take(5000) {
-                b = b.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap_2()
-                        .w_full()
-                        .px_3()
-                        .child(div().flex_none().w(px(44.0)).text_color(color::dim()).child(format!("{}", l.line_no)))
-                        .child(div().flex_none().w(px(64.0)).text_color(color::accent()).child(l.commit.clone()))
-                        .child(
-                            div()
-                                .flex_none()
-                                .w(px(110.0))
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_color(color::dim())
-                                .child(l.author.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .whitespace_nowrap()
-                                .text_color(color::fg())
-                                .child(l.content.clone()),
-                        ),
-                );
-            }
-            b.into_any_element()
-        };
-
-        div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .h(px(340.0))
-            .border_t_1()
-            .border_color(color::line())
-            .bg(color::bg())
-            .child(head)
-            .child(content)
+                .px_3()
+                .bg(bg)
+                .text_color(fg)
+                .whitespace_nowrap()
+                .child(format!("{sign} {content}"))
+                .into_any_element()
+        }
     }
+}
+
+/// Una fila de blame virtualizada: línea · commit · autor · texto.
+fn blame_line_el(l: &BlameLine) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .h(px(DIFF_ROW_H))
+        .w_full()
+        .px_3()
+        .child(div().flex_none().w(px(44.0)).text_color(color::dim()).child(format!("{}", l.line_no)))
+        .child(div().flex_none().w(px(64.0)).text_color(color::accent()).child(l.commit.clone()))
+        .child(
+            div()
+                .flex_none()
+                .w(px(110.0))
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_color(color::dim())
+                .child(l.author.clone()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .whitespace_nowrap()
+                .text_color(color::fg())
+                .child(l.content.clone()),
+        )
 }
 
 /// Una fila del log (clicable): gutter del graph · summary · autor · hash.
@@ -526,6 +575,7 @@ fn main() {
         },
         None => (None, Vec::new()),
     };
+    let diff_rows = build_diff_rows(&diff);
 
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1100.0), px(760.0)), cx);
@@ -543,6 +593,7 @@ fn main() {
                     error,
                     selected,
                     diff,
+                    diff_rows,
                     diff_error: None,
                     blame: None,
                 })
