@@ -1,7 +1,7 @@
-//! rebased-rs — ventana nativa (GPUI): log graph + visor de diff.
-//! M2: log virtualizado + DAG.  M3: clic en commit → diff abajo.
+//! rebased-rs — native window (GPUI): log graph + diff viewer.
+//! M2: virtualized log + DAG.  M3: click a commit → diff below.
 //!
-//! Uso:  rebased-rs [ruta-al-repo] [limit]   (por defecto: . y 50000)
+//! Usage:  rebased-rs [repo-path] [limit]   (default: . and 50000)
 
 use git_core::blame::BlameLine;
 use git_core::diff::{FileDiff, LineOrigin};
@@ -17,10 +17,10 @@ const ROW_H: f32 = 24.0;
 const LANE_W: f32 = 14.0;
 const DOT: f32 = 8.0;
 const MAX_LANES: usize = 14;
-/// Altura de fila en los paneles de diff/blame (monospace, virtualizados).
+/// Row height in the diff/blame panels (monospace, virtualized).
 const DIFF_ROW_H: f32 = 18.0;
 
-/// Paleta estilo IntelliJ "New UI" (dark).
+/// IntelliJ "New UI" (dark) palette.
 mod color {
     use gpui::{rgb, Rgba};
     pub fn bg() -> Rgba { rgb(0x1e1f22) }
@@ -42,7 +42,7 @@ mod color {
     pub fn tab_active() -> Rgba { rgb(0x1e1f22) }
 }
 
-/// Vistas principales de la app (pestañas).
+/// Main app views (tabs).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Log,
@@ -50,20 +50,20 @@ enum ViewMode {
     Branches,
 }
 
-/// Una fila del editor de rebase interactivo.
+/// A row of the interactive rebase editor.
 struct PlanRow {
     id: String,
     summary: String,
     action: RebaseAction,
 }
 
-/// Plan de rebase interactivo en edición.
+/// Interactive rebase plan being edited.
 struct RebasePlan {
     base: String,
     steps: Vec<PlanRow>,
 }
 
-/// Colores de rama del graph (se ciclan por índice de lane).
+/// Graph branch colors (cycled by lane index).
 fn branch_color(c: u32) -> Rgba {
     const P: [u32; 8] = [
         0x548af7, 0x59a869, 0xd9923a, 0xc9555f, 0x9876d6, 0x4aa3a3, 0xc2924a, 0xd06fb3,
@@ -71,24 +71,24 @@ fn branch_color(c: u32) -> Rgba {
     rgb(P[(c as usize) % P.len()])
 }
 
-/// Anotación de un archivo (modo blame del panel inferior).
+/// A file's annotation (the bottom panel's blame mode).
 struct BlameView {
     file: String,
     lines: Vec<BlameLine>,
     error: Option<String>,
-    /// `true` mientras el blame se calcula en background (no congela la UI).
+    /// `true` while blame computes in the background (does not freeze the UI).
     loading: bool,
 }
 
-/// Fila plana del diff, para virtualizar con `uniform_list` (todas ~misma altura).
+/// Flat diff row, for virtualizing with `uniform_list` (all ~same height).
 enum DiffRow {
-    /// Cabecera de archivo (clicable → blame). `String` = ruta; el resto = etiqueta.
+    /// File header (clickable → blame). `String` = path; the rest = label.
     File(String, String),
     Hunk(String),
     Line(LineOrigin, String),
 }
 
-/// Aplana el diff (archivos→hunks→líneas) en filas para la lista virtualizada.
+/// Flattens the diff (files→hunks→lines) into rows for the virtualized list.
 fn build_diff_rows(diff: &[FileDiff]) -> Vec<DiffRow> {
     let mut rows = Vec::new();
     for f in diff {
@@ -116,43 +116,43 @@ struct RebasedApp {
     error: Option<String>,
     selected: Option<usize>,
     diff: Vec<FileDiff>,
-    /// Diff aplanado para la lista virtualizada (deriva de `diff`).
+    /// Flattened diff for the virtualized list (derived from `diff`).
     diff_rows: Vec<DiffRow>,
     diff_error: Option<String>,
-    /// Si está `Some`, el panel inferior muestra blame en vez del diff.
+    /// If `Some`, the bottom panel shows blame instead of the diff.
     blame: Option<BlameView>,
 
-    // ---- Vistas / navegación ----
+    // ---- Views / navigation ----
     view: ViewMode,
-    /// Toast con el resultado de la última operación (commit, push, etc.).
+    /// Toast with the result of the last operation (commit, push, etc.).
     op_msg: Option<String>,
 
-    // ---- Cambios Locales (M4) ----
+    // ---- Local Changes (M4) ----
     status: Vec<StatusEntry>,
     status_error: Option<String>,
-    /// Diff (working tree) del archivo de cambios seleccionado.
+    /// Working-tree diff of the selected changed file.
     wt_rows: Vec<DiffRow>,
     wt_file: Option<String>,
     commit_msg: String,
     commit_focus: FocusHandle,
 
-    // ---- Ramas (M5) ----
+    // ---- Branches (M5) ----
     branches: Vec<BranchInfo>,
     new_branch: String,
     branch_focus: FocusHandle,
 
-    // ---- Rebase interactivo (M6) ----
+    // ---- Interactive rebase (M6) ----
     rebase: Option<RebasePlan>,
 }
 
 impl RebasedApp {
-    /// Selecciona un commit y carga su diff (reabre el repo: ~1 ms).
+    /// Selects a commit and loads its diff (reopens the repo: ~1 ms).
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
         if self.selected == Some(ix) {
             return;
         }
         self.selected = Some(ix);
-        self.blame = None; // al cambiar de commit, volvemos a vista de diff
+        self.blame = None; // switching commit returns to the diff view
         let id = self.commits[ix].id.clone();
         match git_core::diff::commit_diff(&self.repo_path, &id) {
             Ok(files) => {
@@ -169,14 +169,14 @@ impl RebasedApp {
         cx.notify();
     }
 
-    /// Muestra el blame de `file` en el commit seleccionado. Calcula en background
-    /// (blame puede tardar ~1s en historia profunda) para NO congelar la UI.
+    /// Shows blame for `file` at the selected commit. Computes in the background
+    /// (blame can take ~1s on deep history) so it does NOT freeze the UI.
     fn show_blame(&mut self, file: String, cx: &mut Context<Self>) {
         let Some(ix) = self.selected else { return };
         let id = self.commits[ix].id.clone();
         let repo_path = self.repo_path.clone();
 
-        // Estado "cargando" inmediato (la UI sigue respondiendo).
+        // Immediate "loading" state (the UI stays responsive).
         self.blame = Some(BlameView {
             file: file.clone(),
             lines: Vec::new(),
@@ -192,7 +192,7 @@ impl RebasedApp {
                 .spawn(async move { git_core::blame::blame_file(&path, &id2, &file2) })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                // Aplicar solo si seguimos esperando el blame de ESTE archivo.
+                // Apply only if we're still waiting for THIS file's blame.
                 let waiting = matches!(&this.blame, Some(bv) if bv.file == file && bv.loading);
                 if waiting {
                     this.blame = Some(match result {
@@ -206,13 +206,13 @@ impl RebasedApp {
         .detach();
     }
 
-    /// Vuelve del modo blame a la vista de diff.
+    /// Returns from blame mode to the diff view.
     fn clear_blame(&mut self, cx: &mut Context<Self>) {
         self.blame = None;
         cx.notify();
     }
 
-    // ---- Navegación entre vistas ----
+    // ---- View navigation ----
     fn set_view(&mut self, view: ViewMode, cx: &mut Context<Self>) {
         self.view = view;
         self.op_msg = None;
@@ -223,9 +223,9 @@ impl RebasedApp {
         }
     }
 
-    // ---- Cambios Locales (M4) ----
-    /// Carga status (+ diff del archivo seleccionado) EN BACKGROUND: en repos
-    /// enormes el status escanea 200k+ archivos (~4s) y no debe congelar la UI.
+    // ---- Local Changes (M4) ----
+    /// Loads status (+ the selected file's diff) IN THE BACKGROUND: on huge
+    /// repos status scans 200k+ files (~4s) and must not freeze the UI.
     fn refresh_status(&mut self, cx: &mut Context<Self>) {
         let path = self.repo_path.clone();
         let wt_file = self.wt_file.clone();
@@ -320,7 +320,7 @@ impl RebasedApp {
         cx.notify();
     }
 
-    // ---- Ramas (M5) ----
+    // ---- Branches (M5) ----
     fn refresh_branches(&mut self, cx: &mut Context<Self>) {
         match git_core::Repo::open(&self.repo_path).and_then(|r| r.branches()) {
             Ok(b) => self.branches = b,
@@ -380,7 +380,7 @@ impl RebasedApp {
         cx.notify();
     }
 
-    /// Recarga el log tras una operación que pudo cambiar HEAD.
+    /// Reloads the log after an operation that may have changed HEAD.
     fn reload_log(&mut self) {
         if let Ok(commits) = git_core::gix_log(&self.repo_path, 50_000) {
             self.graph = compute_graph(&commits);
@@ -395,8 +395,8 @@ impl RebasedApp {
         }
     }
 
-    // ---- Remoto (M7) / Stash (M8) ----
-    /// Ejecuta una operación de red en background (no congela la UI).
+    // ---- Remote (M7) / Stash (M8) ----
+    /// Runs a network operation in the background (does not freeze the UI).
     fn run_remote(&mut self, op: &'static str, cx: &mut Context<Self>) {
         self.op_msg = Some(format!("{op}…"));
         cx.notify();
@@ -442,8 +442,8 @@ impl RebasedApp {
         self.refresh_status(cx);
     }
 
-    // ---- Rebase interactivo (M6) ----
-    /// Abre el editor de rebase: reaplica los commits desde el padre de `ix` hasta HEAD.
+    // ---- Interactive rebase (M6) ----
+    /// Opens the rebase editor: replays commits from `ix`'s parent up to HEAD.
     fn start_rebase(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(commit) = self.commits.get(ix) else { return };
         let Some(base) = commit.parents.first().cloned() else {
@@ -464,7 +464,7 @@ impl RebasedApp {
         cx.notify();
     }
 
-    /// Cicla la acción de un paso: Pick → Squash → Fixup → Drop → Pick.
+    /// Cycles a step's action: Pick → Squash → Fixup → Drop → Pick.
     fn rebase_cycle(&mut self, i: usize, cx: &mut Context<Self>) {
         if let Some(p) = &mut self.rebase {
             if let Some(row) = p.steps.get_mut(i) {
@@ -479,7 +479,7 @@ impl RebasedApp {
         cx.notify();
     }
 
-    /// Reordena un paso del plan.
+    /// Reorders a plan step.
     fn rebase_move(&mut self, i: usize, up: bool, cx: &mut Context<Self>) {
         if let Some(p) = &mut self.rebase {
             let j = if up {
@@ -496,7 +496,7 @@ impl RebasedApp {
         cx.notify();
     }
 
-    /// Ejecuta el plan de rebase.
+    /// Runs the rebase plan.
     fn apply_rebase(&mut self, cx: &mut Context<Self>) {
         let Some(plan) = self.rebase.take() else { return };
         let steps: Vec<RebaseStep> = plan
@@ -524,7 +524,7 @@ impl RebasedApp {
     }
 }
 
-/// Aplica una tecla a un buffer de texto (input minimalista).
+/// Applies a key to a text buffer (minimal input).
 fn edit_key(buf: &mut String, ev: &KeyDownEvent, multiline: bool) {
     match ev.keystroke.key.as_str() {
         "backspace" => {
@@ -555,7 +555,7 @@ fn short(id: &str) -> String {
     id.get(..7).unwrap_or(id).to_string()
 }
 
-/// Formatea segundos Unix a `YYYY-MM-DD` (algoritmo civil de Hinnant, sin deps).
+/// Formats Unix seconds to `YYYY-MM-DD` (Hinnant's civil algorithm, no deps).
 fn fmt_date(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let z = days + 719_468;
@@ -609,7 +609,7 @@ impl Render for RebasedApp {
 }
 
 impl RebasedApp {
-    /// Barra superior: pestañas (Log/Cambios/Ramas) + acciones de red/stash.
+    /// Top bar: tabs (Log/Changes/Branches) + network/stash actions.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let e = cx.entity();
         let view = self.view;
@@ -664,7 +664,7 @@ impl RebasedApp {
             .into_any_element()
     }
 
-    /// Vista Log (Historia): log graph virtualizado + panel diff/blame.
+    /// Log view: virtualized log graph + diff/blame panel.
     fn render_log(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entity = cx.entity();
         let log = match &self.error {
@@ -724,7 +724,7 @@ impl RebasedApp {
             .into_any_element()
     }
 
-    /// Vista Cambios Locales (M4): status + stage/unstage + diff WT + commit.
+    /// Local Changes view (M4): status + stage/unstage + WT diff + commit.
     fn render_changes(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let e = cx.entity();
         let mut list = div()
@@ -790,7 +790,7 @@ impl RebasedApp {
             }
         }
 
-        // diff del working tree del archivo seleccionado (virtualizado)
+        // working-tree diff of the selected file (virtualized)
         let diff_area = if self.wt_rows.is_empty() {
             div().flex_1().min_h_0().p_3().text_color(color::dim()).child("Select a file to view its diff").into_any_element()
         } else {
@@ -813,7 +813,7 @@ impl RebasedApp {
                 .into_any_element()
         };
 
-        // caja de commit
+        // commit box
         let commit_box = div()
             .flex()
             .flex_col()
@@ -866,7 +866,7 @@ impl RebasedApp {
             .into_any_element()
     }
 
-    /// Vista Ramas (M5): lista con checkout/merge/borrar + crear rama.
+    /// Branches view (M5): list with checkout/merge/delete + create branch.
     fn render_branches(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let e = cx.entity();
         let mut list = div()
@@ -946,7 +946,7 @@ impl RebasedApp {
         div().flex().flex_col().flex_1().min_h_0().child(list).child(create).into_any_element()
     }
 
-    /// Editor visual de rebase interactivo (M6).
+    /// Visual interactive-rebase editor (M6).
     fn render_rebase_editor(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let e = cx.entity();
         let plan = match &self.rebase {
@@ -1043,7 +1043,7 @@ impl RebasedApp {
     }
 }
 
-/// Etiqueta corta de una acción de rebase.
+/// Short label for a rebase action.
 fn action_label(a: &RebaseAction) -> &'static str {
     match a {
         RebaseAction::Pick => "PICK",
@@ -1054,7 +1054,7 @@ fn action_label(a: &RebaseAction) -> &'static str {
     }
 }
 
-/// Botón pequeño de la UI.
+/// Small UI button.
 fn btn(id: &str, label: &str, on: impl Fn(&mut App) + 'static) -> impl IntoElement {
     div()
         .id(SharedString::from(id.to_string()))
@@ -1069,7 +1069,7 @@ fn btn(id: &str, label: &str, on: impl Fn(&mut App) + 'static) -> impl IntoEleme
         .child(label.to_string())
 }
 
-/// Fila del diff del working tree (sin acción de blame).
+/// Working-tree diff row (no blame action).
 fn wt_row_el(row: &DiffRow) -> gpui::AnyElement {
     match row {
         DiffRow::File(_, label) => div()
@@ -1113,9 +1113,9 @@ fn wt_row_el(row: &DiffRow) -> gpui::AnyElement {
 }
 
 impl RebasedApp {
-    /// Panel inferior: diff del commit, o blame de un archivo si está activo.
-    /// Ambos listados están VIRTUALIZADOS (uniform_list) → render y scroll fluidos
-    /// aunque el archivo tenga decenas de miles de líneas.
+    /// Bottom panel: the commit diff, or a file's blame if active.
+    /// Both lists are VIRTUALIZED (uniform_list) → smooth render and scroll
+    /// even if the file has tens of thousands of lines.
     fn render_diff_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let container = div()
             .flex()
@@ -1126,7 +1126,7 @@ impl RebasedApp {
             .border_color(color::line())
             .bg(color::bg());
 
-        // ---- Modo blame ----
+        // ---- Blame mode ----
         if let Some(bv) = &self.blame {
             let head = {
                 let e = cx.entity();
@@ -1182,7 +1182,7 @@ impl RebasedApp {
             return container.child(head).child(body).into_any_element();
         }
 
-        // ---- Modo diff ----
+        // ---- Diff mode ----
         let head = match self.selected {
             Some(ix) => {
                 let c = &self.commits[ix];
@@ -1246,7 +1246,7 @@ impl RebasedApp {
     }
 }
 
-/// Una fila del diff virtualizado: cabecera de archivo (clicable→blame), hunk, o línea ±.
+/// A virtualized diff row: file header (clickable→blame), hunk, or ± line.
 fn diff_row_el(row: &DiffRow, entity: &Entity<RebasedApp>) -> gpui::AnyElement {
     match row {
         DiffRow::File(path, label) => {
@@ -1300,7 +1300,7 @@ fn diff_row_el(row: &DiffRow, entity: &Entity<RebasedApp>) -> gpui::AnyElement {
     }
 }
 
-/// Una fila de blame virtualizada: línea · commit · autor · texto.
+/// A virtualized blame row: line · commit · author · text.
 fn blame_line_el(l: &BlameLine) -> impl IntoElement {
     div()
         .flex()
@@ -1331,7 +1331,7 @@ fn blame_line_el(l: &BlameLine) -> impl IntoElement {
         )
 }
 
-/// Una fila del log (clicable): gutter del graph · summary · autor · hash.
+/// A log row (clickable): graph gutter · summary · author · hash.
 fn commit_row(
     c: &CommitInfo,
     g: &RowGraph,
@@ -1402,7 +1402,7 @@ fn commit_row(
         )
 }
 
-/// Gutter del graph: una línea vertical por lane activo + el punto del commit.
+/// Graph gutter: one vertical line per active lane + the commit dot.
 fn graph_gutter(g: &RowGraph, width: usize) -> impl IntoElement {
     let mut gutter = div()
         .relative()
@@ -1466,9 +1466,9 @@ fn main() {
         Err(e) => (Vec::new(), Vec::new(), 1, Some(format!("Could not open repo: {e}"))),
     };
 
-    // Precalentar el diff del commit más reciente: deja el cache del repo gix
-    // caliente en el hilo de UI (los clics siguientes son instantáneos) y muestra
-    // ya su diff por defecto, como hace Rebased.
+    // Pre-warm the most recent commit's diff: leaves the gix repo cache
+    // warm on the UI thread (subsequent clicks are instant) and shows
+    // its diff by default, like Rebased does.
     let (selected, diff) = match commits.first() {
         Some(c) => match git_core::diff::commit_diff(&repo_path, &c.id) {
             Ok(d) => (Some(0usize), d),

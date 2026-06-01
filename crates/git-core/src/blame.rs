@@ -1,19 +1,19 @@
-//! Motor de blame/annotate: por cada línea de un archivo, qué commit la introdujo.
-//! Usa el blame de gix (rápido sobre el ODB de gitoxide). Independiente de la UI.
+//! Blame/annotate engine: for each line of a file, which commit introduced it.
+//! Uses gix blame (fast on the gitoxide ODB). UI-independent.
 
 use std::collections::HashMap;
 
-/// Una línea anotada del archivo.
+/// An annotated line of the file.
 #[derive(Debug, Clone)]
 pub struct BlameLine {
     pub line_no: u32,
-    /// Hash corto (8) del commit que introdujo la línea.
+    /// Short hash (8) of the commit that introduced the line.
     pub commit: String,
     pub author: String,
     pub content: String,
 }
 
-/// Anota cada línea de `file_path` tal como está en `commit_id`.
+/// Annotates each line of `file_path` as of `commit_id`.
 pub fn blame_file(
     repo_path: &str,
     commit_id: &str,
@@ -29,14 +29,14 @@ pub fn blame_file(
         .blame_file(BStr::new(file_path), suspect, Default::default())
         .map_err(|e| e.to_string())?;
 
-    // Contenido del archivo, partido en líneas para tomar el texto de cada una.
+    // File contents, split into lines to get each line's text.
     let lines: Vec<String> = outcome
         .blob
         .split(|&b| b == b'\n')
         .map(|l| String::from_utf8_lossy(l).into_owned())
         .collect();
 
-    // Cache de metadatos por commit (evita re-buscar autor del mismo commit).
+    // Per-commit metadata cache (avoids re-looking up the same commit's author).
     let mut meta: HashMap<gix::ObjectId, (String, String)> = HashMap::new();
     let mut out: Vec<BlameLine> = Vec::with_capacity(lines.len());
 
@@ -59,12 +59,12 @@ pub fn blame_file(
         }
     }
 
-    // Las entradas no vienen necesariamente en orden de línea.
+    // Entries don't necessarily come in line order.
     out.sort_by_key(|l| l.line_no);
     Ok(out)
 }
 
-/// (hash corto, autor) de un commit, tolerante a errores.
+/// (short hash, author) of a commit, error-tolerant.
 fn commit_meta(repo: &gix::Repository, id: gix::ObjectId) -> (String, String) {
     let full = id.to_string();
     let short = full.get(..8).unwrap_or(&full).to_string();

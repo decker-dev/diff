@@ -1,16 +1,16 @@
-//! Motor de rebase interactivo por *replay*: reconstruye la historia aplicando
-//! cada commit (vía merge de árboles = cherry-pick) sobre una base nueva, según
-//! un plan de pasos. Soporta pick, reword, squash, fixup, drop y reordenado (por
-//! el orden de los pasos). Independiente de la UI.
+//! Interactive rebase engine via *replay*: rebuilds history by applying
+//! each commit (via tree merge = cherry-pick) onto a new base, following
+//! a step plan. Supports pick, reword, squash, fixup, drop and reordering (by
+//! the order of the steps). UI-independent.
 //!
-//! No es la máquina de estados completa de `git rebase` (no hay abort/resume en
-//! disco), pero implementa las operaciones interactivas centrales en memoria y
-//! mueve la rama actual al resultado. Si un paso genera conflicto, se aborta sin
-//! tocar la rama (devuelve `Conflict`).
+//! Not the full `git rebase` state machine (no on-disk abort/resume),
+//! but it implements the core interactive operations in memory and
+//! moves the current branch to the result. If a step conflicts, it aborts without
+//! touching the branch (returns `Conflict`).
 
 use crate::Error;
 
-/// Acción sobre un commit en el plan de rebase.
+/// Action on a commit in the rebase plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebaseAction {
     Pick,
@@ -20,23 +20,23 @@ pub enum RebaseAction {
     Drop,
 }
 
-/// Un paso del plan: qué commit y qué hacer con él.
+/// A plan step: which commit and what to do with it.
 #[derive(Debug, Clone)]
 pub struct RebaseStep {
     pub commit: String,
     pub action: RebaseAction,
 }
 
-/// Resultado de un rebase.
+/// Result of a rebase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebaseResult {
-    /// Terminó; nuevo hash de la punta de la rama.
+    /// Finished; new hash of the branch tip.
     Done(String),
-    /// Conflicto al aplicar este commit; la rama no se tocó.
+    /// Conflict applying this commit; the branch was not touched.
     Conflict(String),
 }
 
-/// Ejecuta un plan de rebase interactivo sobre `base`, reescribiendo la rama actual.
+/// Runs an interactive rebase plan onto `base`, rewriting the current branch.
 pub(crate) fn run_interactive(
     repo: &git2::Repository,
     base: &str,
@@ -52,8 +52,8 @@ pub(crate) fn run_interactive(
         let commit = repo.find_commit(git2::Oid::from_str(&step.commit)?)?;
         let parent = commit.parent(0)?;
 
-        // Cherry-pick por merge de árboles: ancestro=padre del commit,
-        // "nuestro"=head reconstruido, "suyo"=el commit a aplicar.
+        // Cherry-pick via tree merge: ancestor=commit's parent,
+        // "ours"=rebuilt head, "theirs"=the commit to apply.
         let mut idx = repo.merge_trees(&parent.tree()?, &head.tree()?, &commit.tree()?, None)?;
         if idx.has_conflicts() {
             return Ok(RebaseResult::Conflict(step.commit.clone()));
@@ -61,7 +61,7 @@ pub(crate) fn run_interactive(
         let tree = repo.find_tree(idx.write_tree_to(repo)?)?;
 
         head = match &step.action {
-            // Squash/Fixup: fundir en head (mismo padre que head, árbol combinado).
+            // Squash/Fixup: meld into head (same parent as head, combined tree).
             RebaseAction::Squash | RebaseAction::Fixup => {
                 let head_parent = head.parent(0)?;
                 let msg = if step.action == RebaseAction::Fixup {
@@ -80,7 +80,7 @@ pub(crate) fn run_interactive(
                 let oid = repo.commit(None, &sig, &sig, m, &tree, &[&head])?;
                 repo.find_commit(oid)?
             }
-            // Pick (y Drop ya filtrado arriba).
+            // Pick (Drop already filtered above).
             _ => {
                 let oid = repo.commit(
                     None,
@@ -95,17 +95,17 @@ pub(crate) fn run_interactive(
         };
     }
 
-    // Mover la rama actual al resultado y actualizar el working tree.
+    // Move the current branch to the result and update the working tree.
     let mut head_ref = repo.head()?;
-    head_ref.set_target(head.id(), "rebase interactivo")?;
+    head_ref.set_target(head.id(), "interactive rebase")?;
     let mut cb = git2::build::CheckoutBuilder::new();
     cb.force();
     repo.checkout_head(Some(&mut cb))?;
     Ok(RebaseResult::Done(head.id().to_string()))
 }
 
-/// Rebase no interactivo: reaplica los commits de HEAD (desde la merge-base con
-/// `upstream`) sobre la punta de `upstream`.
+/// Non-interactive rebase: replays HEAD's commits (from the merge-base with
+/// `upstream`) onto the tip of `upstream`.
 pub(crate) fn rebase_onto(repo: &git2::Repository, upstream: &str) -> Result<RebaseResult, Error> {
     let upstream_commit = repo
         .find_branch(upstream, git2::BranchType::Local)?

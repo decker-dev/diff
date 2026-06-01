@@ -1,17 +1,17 @@
-//! Motor de diff: dado un commit, produce el diff estructurado (por archivo,
-//! hunks y líneas con origen +/-/contexto). Independiente de la UI.
+//! Diff engine: given a commit, produces the structured diff (per file,
+//! hunks and lines with origin +/-/context). UI-independent.
 //!
-//! Rendimiento: el tree-diff (saber QUÉ archivos cambiaron) lo hace **gix**,
-//! cuyo acceso a objetos es ~20x más rápido que libgit2 en repos grandes. El
-//! diff de líneas de cada blob se hace con `git2::Patch::from_buffers` sobre los
-//! bytes ya leídos (diff en memoria, sin tocar el object store). Así pasamos de
-//! ~460 ms/commit (libgit2 tree-diff) a la velocidad del git CLI.
+//! Performance: the tree-diff (which files changed) is done by **gix**,
+//! whose object access is ~20x faster than libgit2 on large repos. The
+//! per-blob line diff uses `git2::Patch::from_buffers` over the
+//! already-read bytes (in-memory diff, no object store). This takes us from
+//! ~460 ms/commit (libgit2 tree-diff) to git-CLI speed.
 
 use crate::FileState;
 use std::cell::RefCell;
 use std::path::Path;
 
-/// Origen de una línea del diff.
+/// Origin of a diff line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineOrigin {
     Context,
@@ -19,7 +19,7 @@ pub enum LineOrigin {
     Del,
 }
 
-/// Una línea dentro de un hunk.
+/// A line within a hunk.
 #[derive(Debug, Clone)]
 pub struct DiffLine {
     pub origin: LineOrigin,
@@ -28,14 +28,14 @@ pub struct DiffLine {
     pub content: String,
 }
 
-/// Un hunk (`@@ -a,b +c,d @@`) con sus líneas.
+/// A hunk (`@@ -a,b +c,d @@`) with its lines.
 #[derive(Debug, Clone)]
 pub struct Hunk {
     pub header: String,
     pub lines: Vec<DiffLine>,
 }
 
-/// El diff de un archivo dentro de un commit.
+/// The diff of one file within a commit.
 #[derive(Debug, Clone)]
 pub struct FileDiff {
     pub path: String,
@@ -46,7 +46,7 @@ pub struct FileDiff {
 }
 
 impl FileDiff {
-    /// (añadidas, borradas) — para el resumen tipo `+12 -3`.
+    /// (added, removed) — for the `+12 -3` summary.
     pub fn line_stats(&self) -> (usize, usize) {
         let mut add = 0;
         let mut del = 0;
@@ -64,15 +64,15 @@ impl FileDiff {
 }
 
 thread_local! {
-    /// Repo gix reutilizado entre clics (mismo hilo de UI), con el object-cache
-    /// caliente. Evita reabrir el repo y enfriar el cache en cada diff.
+    /// gix repo reused across clicks (same UI thread), with the object cache
+    /// warm. Avoids reopening the repo and cooling the cache on each diff.
     static DIFF_REPO: RefCell<Option<(String, gix::Repository)>> = const { RefCell::new(None) };
 }
 
-/// Diff de un commit contra su primer padre (o el árbol vacío si es root).
+/// Diff of a commit against its first parent (or the empty tree if root).
 ///
-/// Reutiliza un repo gix cacheado por hilo: el primer diff lo abre, los
-/// siguientes reaprovechan el cache de objetos caliente. Rápido en repos enormes.
+/// Reuses a per-thread cached gix repo: the first diff opens it, the
+/// rest reuse the warm object cache. Fast on huge repos.
 pub fn commit_diff(path: &str, commit_id: &str) -> Result<Vec<FileDiff>, String> {
     DIFF_REPO.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -108,7 +108,7 @@ fn commit_diff_in(repo: &gix::Repository, commit_id: &str) -> Result<Vec<FileDif
         None => repo.empty_tree(),
     };
 
-    // Tree-diff con gix: la parte cara, ahora rápida.
+    // Tree-diff with gix: the expensive part, now fast.
     let changes = repo
         .diff_tree_to_tree(Some(&parent_tree), Some(&tree), None)
         .map_err(|e| e.to_string())?;
@@ -149,7 +149,7 @@ fn commit_diff_in(repo: &gix::Repository, commit_id: &str) -> Result<Vec<FileDif
         let old_bytes = read_blob(repo, old_id)?;
         let new_bytes = read_blob(repo, new_id)?;
 
-        // Diff de líneas en memoria (sin acceso al object store).
+        // In-memory line diff (no object-store access).
         let p = Path::new(&path_s);
         let patch =
             git2::Patch::from_buffers(&old_bytes, Some(p), &new_bytes, Some(p), Some(&mut opts))
@@ -161,8 +161,8 @@ fn commit_diff_in(repo: &gix::Repository, commit_id: &str) -> Result<Vec<FileDif
     Ok(files)
 }
 
-/// Diff de los cambios del working tree: sin stage (index vs WT) si `staged=false`,
-/// o staged (HEAD vs index) si `staged=true`. Para la vista de Cambios Locales.
+/// Diff of working-tree changes: unstaged (index vs WT) if `staged=false`,
+/// or staged (HEAD vs index) if `staged=true`. For the Local Changes view.
 pub fn workdir_diff(path: &str, staged: bool) -> Result<Vec<FileDiff>, String> {
     let repo = git2::Repository::open(path).map_err(|e| e.to_string())?;
     let mut opts = git2::DiffOptions::new();
@@ -203,7 +203,7 @@ pub fn workdir_diff(path: &str, staged: bool) -> Result<Vec<FileDiff>, String> {
     Ok(files)
 }
 
-/// Lee los bytes de un blob por su oid (vacío si `None`).
+/// Reads a blob's bytes by its oid (empty if `None`).
 fn read_blob(repo: &gix::Repository, id: Option<gix::ObjectId>) -> Result<Vec<u8>, String> {
     match id {
         Some(id) => Ok(repo.find_object(id).map_err(|e| e.to_string())?.data.clone()),
@@ -211,11 +211,11 @@ fn read_blob(repo: &gix::Repository, id: Option<gix::ObjectId>) -> Result<Vec<u8
     }
 }
 
-/// Extrae hunks/líneas de un `git2::Patch`. Sin hunks textuales ⇒ binario.
+/// Extracts hunks/lines from a `git2::Patch`. No text hunks ⇒ binary.
 fn patch_to_hunks(patch: git2::Patch) -> Result<(Vec<Hunk>, bool), git2::Error> {
     let n = patch.num_hunks();
     if n == 0 {
-        // Puede ser binario o cambio solo de modo. Lo marcamos binario si hay deltas.
+        // May be binary or a mode-only change. We mark it binary if there are deltas.
         return Ok((Vec::new(), true));
     }
     let mut hunks = Vec::with_capacity(n);
@@ -245,7 +245,7 @@ fn patch_to_hunks(patch: git2::Patch) -> Result<(Vec<Hunk>, bool), git2::Error> 
     Ok((hunks, false))
 }
 
-/// Traduce el `Delta` de libgit2 a nuestro `FileState`.
+/// Translates libgit2's `Delta` to our `FileState`.
 fn map_delta(d: git2::Delta) -> FileState {
     use git2::Delta;
     match d {

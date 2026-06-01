@@ -1,5 +1,5 @@
-//! Benchmark de motores de git (libgit2 vs gitoxide). Sin UI.
-//! Uso:  cargo run -p app --example bench --release -- [ruta-repo] [limit]
+//! Benchmark of git engines (libgit2 vs gitoxide). No UI.
+//! Usage:  cargo run -p app --example bench --release -- [repo-path] [limit]
 
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1000);
 
-    println!("== rebased-rs · benchmark de motor ==");
+    println!("== rebased-rs · engine benchmark ==");
     println!("repo: {path}   limit: {limit}\n");
 
     let repo = git_core::Repo::open(&path)?;

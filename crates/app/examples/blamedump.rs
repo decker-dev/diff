@@ -1,4 +1,4 @@
-//! Verifica el motor de blame. Uso: cargo run -p app --example blamedump --release -- <repo> <archivo> [commit]
+//! Checks the blame engine. Usage: cargo run -p app --example blamedump --release -- <repo> <file> [commit]
 
 use std::time::Instant;
 
@@ -10,14 +10,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => git_core::gix_log(&path, 1)?
             .first()
             .map(|c| c.id.clone())
-            .ok_or("repo vacío")?,
+            .ok_or("empty repo")?,
     };
 
     let t = Instant::now();
     let lines = git_core::blame::blame_file(&path, &commit, &file)?;
     let dt = t.elapsed();
 
-    println!("blame de {file} @ {}  →  {} líneas en {:?}\n", &commit[..8], lines.len(), dt);
+    println!("blame of {file} @ {}  →  {} lines in {:?}\n", &commit[..8], lines.len(), dt);
     for l in lines.iter().take(15) {
         println!("  {:>4} {:8} {:<16} {}", l.line_no, l.commit, trunc(&l.author, 15), trunc(&l.content, 70));
     }
