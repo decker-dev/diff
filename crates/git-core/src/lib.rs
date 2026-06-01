@@ -310,6 +310,49 @@ impl Repo {
     pub fn rebase_onto(&self, upstream: &str) -> Result<rebase::RebaseResult, Error> {
         rebase::rebase_onto(&self.inner, upstream)
     }
+
+    // ---- Remoto (área Remoto) ----
+
+    /// Lista los remotes configurados.
+    pub fn remotes(&self) -> Result<Vec<String>, Error> {
+        Ok(self.inner.remotes()?.iter().flatten().map(str::to_string).collect())
+    }
+
+    /// Ejecuta `git <args>` en el working dir del repo. Lo usamos para las
+    /// operaciones de RED: así reutilizamos las credenciales/SSH del usuario sin
+    /// reimplementar auth ni compilar openssl. La red es I/O, no afecta al perf.
+    fn git_cli(&self, args: &[&str]) -> Result<String, String> {
+        let wd = self
+            .inner
+            .workdir()
+            .ok_or_else(|| "repo sin working dir".to_string())?;
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(wd)
+            .args(args)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
+    /// fetch del remote indicado.
+    pub fn fetch(&self, remote: &str) -> Result<String, String> {
+        self.git_cli(&["fetch", remote])
+    }
+
+    /// pull fast-forward de la rama actual.
+    pub fn pull(&self) -> Result<String, String> {
+        self.git_cli(&["pull", "--ff-only"])
+    }
+
+    /// push de `branch` a `remote`.
+    pub fn push(&self, remote: &str, branch: &str) -> Result<String, String> {
+        self.git_cli(&["push", remote, branch])
+    }
 }
 
 /// `log` vía **gitoxide (gix)** — el motor candidato para las rutas calientes.

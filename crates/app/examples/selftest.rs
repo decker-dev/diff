@@ -92,6 +92,69 @@ fn main() {
         Ok(msg) => println!("  ✓ {msg}"),
         Err(e) => println!("  ✗ FALLO: {e}"),
     }
+
+    println!("\n  -- M7: remoto (push a bare local + remotes) --");
+    match test_remote() {
+        Ok(msg) => println!("  ✓ {msg}"),
+        Err(e) => println!("  ✗ FALLO: {e}"),
+    }
+}
+
+/// Verifica push/remotes contra un remote bare local (sin red ni auth).
+fn test_remote() -> Result<String, String> {
+    let bare = std::env::temp_dir().join("rebased-rs-remote.git");
+    let work = std::env::temp_dir().join("rebased-rs-remote-work");
+    let _ = fs::remove_dir_all(&bare);
+    let _ = fs::remove_dir_all(&work);
+    let bare_path = bare.to_string_lossy().to_string();
+
+    Command::new("git")
+        .args(["init", "--bare", "-q"])
+        .arg(&bare)
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    let work_path = work.to_string_lossy().to_string();
+    let git = |args: &[&str]| {
+        Command::new("git").arg("-C").arg(&work_path).args(args).output().ok();
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@rebased.rs"]);
+    git(&["config", "user.name", "t"]);
+    git(&["remote", "add", "origin", &bare_path]);
+
+    fs::write(work.join("a.txt"), "uno\n").map_err(|e| e.to_string())?;
+    let repo = git_core::Repo::open(&work_path).map_err(es)?;
+    repo.stage("a.txt").map_err(es)?;
+    repo.commit("c1").map_err(es)?;
+
+    let default = repo
+        .branches()
+        .map_err(es)?
+        .into_iter()
+        .find(|b| b.is_head)
+        .map(|b| b.name)
+        .ok_or("sin rama HEAD")?;
+
+    repo.push("origin", &default)?;
+
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&bare)
+        .args(["log", "--oneline"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return Err("el remote bare no recibió el push".into());
+    }
+
+    let remotes = repo.remotes().map_err(es)?;
+    if !remotes.iter().any(|r| r == "origin") {
+        return Err(format!("remotes={remotes:?}"));
+    }
+
+    Ok(format!("push a bare local OK (rama {default}), remotes={remotes:?}"))
 }
 
 /// Crea un repo temporal con commits A, B, C (archivos distintos para no chocar).
