@@ -98,6 +98,56 @@ fn main() {
         Ok(msg) => println!("  ✓ {msg}"),
         Err(e) => println!("  ✗ FALLO: {e}"),
     }
+
+    println!("\n  -- M8: stash (save/list/pop) + ignore --");
+    match test_stash_ignore() {
+        Ok(msg) => println!("  ✓ {msg}"),
+        Err(e) => println!("  ✗ FALLO: {e}"),
+    }
+}
+
+/// Verifica stash (save→revierte, list, pop→reaplica) e ignore.
+fn test_stash_ignore() -> Result<String, String> {
+    let dir = std::env::temp_dir().join("rebased-rs-stash");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.to_string_lossy().to_string();
+    let git = |args: &[&str]| {
+        Command::new("git").arg("-C").arg(&path).args(args).output().ok();
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@rebased.rs"]);
+    git(&["config", "user.name", "t"]);
+
+    fs::write(dir.join("a.txt"), "uno\n").map_err(|e| e.to_string())?;
+    let mut repo = git_core::Repo::open(&path).map_err(es)?;
+    repo.stage("a.txt").map_err(es)?;
+    repo.commit("c1").map_err(es)?;
+
+    // cambio no commiteado → stash
+    fs::write(dir.join("a.txt"), "uno\ndos\n").map_err(|e| e.to_string())?;
+    repo.stash_save("WIP").map_err(es)?;
+    let after_stash = fs::read_to_string(dir.join("a.txt")).map_err(|e| e.to_string())?;
+    if after_stash != "uno\n" {
+        return Err(format!("tras stash, a.txt='{after_stash}' (esperaba revertido)"));
+    }
+    if repo.stash_list().map_err(es)?.is_empty() {
+        return Err("stash_list vacío".into());
+    }
+    repo.stash_pop().map_err(es)?;
+    let after_pop = fs::read_to_string(dir.join("a.txt")).map_err(|e| e.to_string())?;
+    if !after_pop.contains("dos") {
+        return Err("tras pop, no volvió el cambio".into());
+    }
+
+    // ignore
+    repo.add_to_gitignore("*.log").map_err(es)?;
+    fs::write(dir.join("x.log"), "").map_err(|e| e.to_string())?;
+    if !repo.is_ignored("x.log").map_err(es)? {
+        return Err("x.log debería estar ignorado".into());
+    }
+
+    Ok("stash save/list/pop + ignore (*.log) OK".into())
 }
 
 /// Verifica push/remotes contra un remote bare local (sin red ni auth).

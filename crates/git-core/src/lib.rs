@@ -353,6 +353,65 @@ impl Repo {
     pub fn push(&self, remote: &str, branch: &str) -> Result<String, String> {
         self.git_cli(&["push", remote, branch])
     }
+
+    // ---- Otros (área Otros): stash, ignore, conflictos ----
+
+    /// Guarda los cambios actuales en un stash. Devuelve el hash del stash.
+    pub fn stash_save(&mut self, message: &str) -> Result<String, Error> {
+        let sig = self.inner.signature()?;
+        let oid = self.inner.stash_save(&sig, message, None)?;
+        Ok(oid.to_string())
+    }
+
+    /// Lista los stashes (`stash@{i}: mensaje`).
+    pub fn stash_list(&mut self) -> Result<Vec<String>, Error> {
+        let mut out = Vec::new();
+        self.inner.stash_foreach(|idx, msg, _oid| {
+            out.push(format!("stash@{{{idx}}}: {msg}"));
+            true
+        })?;
+        Ok(out)
+    }
+
+    /// Aplica y quita el stash más reciente.
+    pub fn stash_pop(&mut self) -> Result<(), Error> {
+        self.inner.stash_pop(0, None)
+    }
+
+    /// Añade un patrón al `.gitignore` del repo.
+    pub fn add_to_gitignore(&self, pattern: &str) -> Result<(), Error> {
+        use std::io::Write;
+        let wd = self
+            .inner
+            .workdir()
+            .ok_or_else(|| Error::from_str("repo sin working dir"))?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(wd.join(".gitignore"))
+            .map_err(|e| Error::from_str(&e.to_string()))?;
+        writeln!(f, "{pattern}").map_err(|e| Error::from_str(&e.to_string()))?;
+        Ok(())
+    }
+
+    /// ¿Está la ruta ignorada por gitignore?
+    pub fn is_ignored(&self, path: &str) -> Result<bool, Error> {
+        self.inner.is_path_ignored(path)
+    }
+
+    /// Archivos en conflicto (base del visor de merge a 3 vías).
+    pub fn conflicts(&self) -> Result<Vec<String>, Error> {
+        let index = self.inner.index()?;
+        let mut out = Vec::new();
+        if let Ok(conflicts) = index.conflicts() {
+            for c in conflicts.flatten() {
+                if let Some(entry) = c.our.or(c.their).or(c.ancestor) {
+                    out.push(String::from_utf8_lossy(&entry.path).into_owned());
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// `log` vía **gitoxide (gix)** — el motor candidato para las rutas calientes.
