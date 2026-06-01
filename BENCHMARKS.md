@@ -48,6 +48,23 @@ Ventana nativa (Metal) que carga el log con gix y lo renderiza. Build debug, ven
   (`xcodebuild -downloadComponent MetalToolchain`, ~688 MB, una vez).
 - Release debería reducir aún más la RAM. Pendiente medir contra una instancia real de Rebased.
 
+## M3 — diff de un commit (lo que pasa al hacer clic)
+
+Diff de un commit vs su padre en el repo de 505k commits (árboles de 200k+ archivos).
+
+| Implementación | Tiempo / clic | Nota |
+|---|---|---|
+| libgit2 `diff_tree_to_tree` | ~460 ms | acceso a objetos lento (como en el log) |
+| gix tree-diff (reabre repo) | ~83 ms | 5,5x mejor |
+| **gix + repo cacheado caliente** | **2–12 ms** (95 ms el 1er clic) | in-process; **más rápido que git CLI** (20 ms) |
+| git CLI `git diff-tree -p` (ref) | ~20 ms | paga arranque de proceso cada vez |
+
+**Cómo:** gix hace el tree-diff (qué archivos cambian) y lee los blobs; el diff de
+líneas se hace con `git2::Patch::from_buffers` sobre los bytes (en memoria, sin
+object store). El repo gix se reutiliza por hilo con object-cache caliente → los
+clics tras el primero son instantáneos. Mantener el estado caliente in-process es
+exactamente la ventaja frente a lanzar `git` o a la app JVM.
+
 ## Pendiente
 - **status**: con libgit2 tardó ~4,16 s (git CLI ~3,83 s) → es coste de *stat* del working
   tree (200k+ archivos), no del motor. El 10x aquí sale de **fsmonitor** (status incremental),
