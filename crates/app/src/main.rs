@@ -359,6 +359,17 @@ fn main() {
         Err(e) => (Vec::new(), Vec::new(), 1, Some(format!("No se pudo abrir el repo: {e}"))),
     };
 
+    // Precalentar el diff del commit más reciente: deja el cache del repo gix
+    // caliente en el hilo de UI (los clics siguientes son instantáneos) y muestra
+    // ya su diff por defecto, como hace Rebased.
+    let (selected, diff) = match commits.first() {
+        Some(c) => match git_core::diff::commit_diff(&repo_path, &c.id) {
+            Ok(d) => (Some(0usize), d),
+            Err(_) => (None, Vec::new()),
+        },
+        None => (None, Vec::new()),
+    };
+
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1100.0), px(760.0)), cx);
         cx.open_window(
@@ -373,8 +384,8 @@ fn main() {
                     graph,
                     graph_width,
                     error,
-                    selected: None,
-                    diff: Vec::new(),
+                    selected,
+                    diff,
                     diff_error: None,
                 })
             },
