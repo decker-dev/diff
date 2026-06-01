@@ -5,8 +5,8 @@
 
 use git_core::CommitInfo;
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Window, WindowBounds,
-    WindowOptions,
+    div, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds, Context, Window,
+    WindowBounds, WindowOptions,
 };
 
 /// Paleta estilo IntelliJ "New UI" (dark).
@@ -28,7 +28,7 @@ struct RebasedApp {
 }
 
 impl Render for RebasedApp {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = div()
             .flex()
             .flex_row()
@@ -55,12 +55,19 @@ impl Render for RebasedApp {
             );
 
         let body = match &self.error {
-            Some(e) => div().p_3().text_color(color::err()).child(e.clone()),
-            None => div()
-                .flex()
-                .flex_col()
-                .w_full()
-                .children(self.commits.iter().take(80).map(commit_row)),
+            Some(e) => div().flex_1().p_3().text_color(color::err()).child(e.clone()),
+            // Lista virtualizada: solo se renderizan las filas visibles, así
+            // 50k+ commits se desplazan sin coste por fila fuera de pantalla.
+            None => div().flex_1().min_h_0().child(
+                uniform_list(
+                    "commit-log",
+                    self.commits.len(),
+                    cx.processor(|this, range: std::ops::Range<usize>, _window, _cx| {
+                        range.map(|ix| commit_row(&this.commits[ix])).collect::<Vec<_>>()
+                    }),
+                )
+                .size_full(),
+            ),
         };
 
         div()
@@ -116,7 +123,11 @@ fn truncate(s: &str, n: usize) -> String {
 
 fn main() {
     let repo_path = std::env::args().nth(1).unwrap_or_else(|| ".".into());
-    let (commits, error) = match git_core::gix_log(&repo_path, 200) {
+    let limit: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50_000);
+    let (commits, error) = match git_core::gix_log(&repo_path, limit) {
         Ok(c) => (c, None),
         Err(e) => (Vec::new(), Some(format!("No se pudo abrir el repo: {e}"))),
     };
