@@ -50,6 +50,8 @@ struct BlameView {
     file: String,
     lines: Vec<BlameLine>,
     error: Option<String>,
+    /// `true` mientras el blame se calcula en background (no congela la UI).
+    loading: bool,
 }
 
 struct RebasedApp {
@@ -87,16 +89,41 @@ impl RebasedApp {
         cx.notify();
     }
 
-    /// Muestra el blame de `file` tal como está en el commit seleccionado.
+    /// Muestra el blame de `file` en el commit seleccionado. Calcula en background
+    /// (blame puede tardar ~1s en historia profunda) para NO congelar la UI.
     fn show_blame(&mut self, file: String, cx: &mut Context<Self>) {
         let Some(ix) = self.selected else { return };
         let id = self.commits[ix].id.clone();
-        let blame = match git_core::blame::blame_file(&self.repo_path, &id, &file) {
-            Ok(lines) => BlameView { file, lines, error: None },
-            Err(e) => BlameView { file, lines: Vec::new(), error: Some(e) },
-        };
-        self.blame = Some(blame);
+        let repo_path = self.repo_path.clone();
+
+        // Estado "cargando" inmediato (la UI sigue respondiendo).
+        self.blame = Some(BlameView {
+            file: file.clone(),
+            lines: Vec::new(),
+            error: None,
+            loading: true,
+        });
         cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let (path, id2, file2) = (repo_path.clone(), id.clone(), file.clone());
+            let result = cx
+                .background_executor()
+                .spawn(async move { git_core::blame::blame_file(&path, &id2, &file2) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                // Aplicar solo si seguimos esperando el blame de ESTE archivo.
+                let waiting = matches!(&this.blame, Some(bv) if bv.file == file && bv.loading);
+                if waiting {
+                    this.blame = Some(match result {
+                        Ok(lines) => BlameView { file, lines, error: None, loading: false },
+                        Err(e) => BlameView { file, lines: Vec::new(), error: Some(e), loading: false },
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Vuelve del modo blame a la vista de diff.
@@ -304,7 +331,9 @@ impl RebasedApp {
             .child(div().font_family("Menlo").child(bv.file.clone()))
             .child(div().text_color(color::dim()).child("· blame"));
 
-        let content = if let Some(err) = &bv.error {
+        let content = if bv.loading {
+            div().p_3().text_color(color::dim()).child("Cargando blame…").into_any_element()
+        } else if let Some(err) = &bv.error {
             div().p_3().text_color(color::err()).child(err.clone()).into_any_element()
         } else {
             let mut b = div()
