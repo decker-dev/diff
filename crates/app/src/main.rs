@@ -224,36 +224,56 @@ impl RebasedApp {
     }
 
     // ---- Cambios Locales (M4) ----
+    /// Carga status (+ diff del archivo seleccionado) EN BACKGROUND: en repos
+    /// enormes el status escanea 200k+ archivos (~4s) y no debe congelar la UI.
     fn refresh_status(&mut self, cx: &mut Context<Self>) {
-        match git_core::Repo::open(&self.repo_path).and_then(|r| r.status()) {
-            Ok(s) => {
-                self.status = s;
-                self.status_error = None;
-            }
-            Err(e) => {
-                self.status.clear();
-                self.status_error = Some(e.to_string());
-            }
-        }
-        if let Some(f) = self.wt_file.clone() {
-            self.load_wt_diff(f);
-        }
+        let path = self.repo_path.clone();
+        let wt_file = self.wt_file.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = git_core::Repo::open(&path).map_err(|e| e.to_string())?;
+                    let status = repo.status().map_err(|e| e.to_string())?;
+                    let rows = match &wt_file {
+                        Some(f) => {
+                            let un = git_core::diff::workdir_diff(&path, false).unwrap_or_default();
+                            let st = git_core::diff::workdir_diff(&path, true).unwrap_or_default();
+                            un.iter()
+                                .chain(st.iter())
+                                .find(|x| &x.path == f)
+                                .map(|x| build_diff_rows(std::slice::from_ref(x)))
+                                .unwrap_or_default()
+                        }
+                        None => Vec::new(),
+                    };
+                    Ok::<(Vec<StatusEntry>, Vec<DiffRow>), String>((status, rows))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok((s, rows)) => {
+                        this.status = s;
+                        this.status_error = None;
+                        if this.wt_file.is_some() {
+                            this.wt_rows = rows;
+                        }
+                    }
+                    Err(e) => {
+                        this.status.clear();
+                        this.status_error = Some(e);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
-    }
-
-    fn load_wt_diff(&mut self, path: String) {
-        let unstaged = git_core::diff::workdir_diff(&self.repo_path, false).unwrap_or_default();
-        let staged = git_core::diff::workdir_diff(&self.repo_path, true).unwrap_or_default();
-        let found = unstaged.iter().chain(staged.iter()).find(|f| f.path == path);
-        self.wt_rows = found
-            .map(|f| build_diff_rows(std::slice::from_ref(f)))
-            .unwrap_or_default();
-        self.wt_file = Some(path);
     }
 
     fn select_wt_file(&mut self, path: String, cx: &mut Context<Self>) {
-        self.load_wt_diff(path);
-        cx.notify();
+        self.wt_file = Some(path);
+        self.refresh_status(cx);
     }
 
     fn toggle_stage(&mut self, path: String, staged: bool, cx: &mut Context<Self>) {
@@ -273,7 +293,7 @@ impl RebasedApp {
     fn do_commit(&mut self, amend: bool, cx: &mut Context<Self>) {
         let msg = self.commit_msg.trim().to_string();
         if msg.is_empty() && !amend {
-            self.op_msg = Some("Escribí un mensaje de commit".into());
+            self.op_msg = Some("Write a commit message".into());
             cx.notify();
             return;
         }
@@ -286,7 +306,7 @@ impl RebasedApp {
         });
         match r {
             Ok(id) => {
-                self.op_msg = Some(format!("✓ commit {}", short(&id)));
+                self.op_msg = Some(format!("✓ committed {}", short(&id)));
                 self.commit_msg.clear();
                 self.reload_log();
             }
@@ -335,7 +355,7 @@ impl RebasedApp {
     fn do_delete_branch(&mut self, name: String, cx: &mut Context<Self>) {
         let r = git_core::Repo::open(&self.repo_path)
             .and_then(|repo| repo.delete_branch(&name))
-            .map(|_| format!("borrada {name}"));
+            .map(|_| format!("deleted {name}"));
         self.branch_op(r, cx);
     }
 
@@ -347,7 +367,7 @@ impl RebasedApp {
         self.new_branch.clear();
         let r = git_core::Repo::open(&self.repo_path)
             .and_then(|repo| repo.create_branch(&name))
-            .map(|_| format!("creada {name}"));
+            .map(|_| format!("created {name}"));
         self.branch_op(r, cx);
     }
 
@@ -427,7 +447,7 @@ impl RebasedApp {
     fn start_rebase(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(commit) = self.commits.get(ix) else { return };
         let Some(base) = commit.parents.first().cloned() else {
-            self.op_msg = Some("No se puede rebasar sobre el commit raíz".into());
+            self.op_msg = Some("Cannot rebase the root commit".into());
             cx.notify();
             return;
         };
@@ -491,7 +511,7 @@ impl RebasedApp {
             .and_then(|repo| repo.rebase_interactive(&plan.base, &steps));
         self.op_msg = Some(match r {
             Ok(RebaseResult::Done(id)) => format!("✓ rebase OK → {}", short(&id)),
-            Ok(RebaseResult::Conflict(c)) => format!("✗ conflicto al aplicar {}", short(&c)),
+            Ok(RebaseResult::Conflict(c)) => format!("✗ conflict applying {}", short(&c)),
             Err(e) => format!("✗ {e}"),
         });
         self.reload_log();
@@ -533,6 +553,22 @@ fn first_line(s: &str) -> String {
 
 fn short(id: &str) -> String {
     id.get(..7).unwrap_or(id).to_string()
+}
+
+/// Formatea segundos Unix a `YYYY-MM-DD` (algoritmo civil de Hinnant, sin deps).
+fn fmt_date(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 impl Render for RebasedApp {
@@ -618,8 +654,8 @@ impl RebasedApp {
             .border_color(color::line())
             .child(div().px_2().text_color(color::accent()).child("rebased-rs"))
             .child(tab("Log", ViewMode::Log))
-            .child(tab("Cambios", ViewMode::Changes))
-            .child(tab("Ramas", ViewMode::Branches))
+            .child(tab("Changes", ViewMode::Changes))
+            .child(tab("Branches", ViewMode::Branches))
             .child(div().flex_1().min_w_0().text_color(color::dim()).text_sm().px_2().whitespace_nowrap().text_ellipsis().child(if cur.is_empty() { String::new() } else { format!("⎇ {cur}") }))
             .child(btn("tb-fetch", "Fetch", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.run_remote("fetch", cx)); } }))
             .child(btn("tb-pull", "Pull", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.run_remote("pull", cx)); } }))
@@ -659,11 +695,30 @@ impl RebasedApp {
                 )
                 .into_any_element(),
         };
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .h(px(22.0))
+            .px_2()
+            .gap_2()
+            .bg(color::panel())
+            .border_b_1()
+            .border_color(color::line())
+            .text_xs()
+            .text_color(color::dim())
+            .child(div().flex_none().w(px(self.graph_width as f32 * LANE_W)))
+            .child(div().flex_1().min_w_0().child("Message"))
+            .child(div().flex_none().w(px(150.0)).child("Author"))
+            .child(div().flex_none().w(px(88.0)).child("Date"))
+            .child(div().flex_none().w(px(68.0)).child("Hash"));
         div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
+            .child(header)
             .child(log)
             .child(self.render_diff_panel(cx))
             .into_any_element()
@@ -685,7 +740,7 @@ impl RebasedApp {
         if let Some(err) = &self.status_error {
             list = list.child(div().p_3().text_color(color::err()).child(err.clone()));
         } else if self.status.is_empty() {
-            list = list.child(div().p_3().text_color(color::dim()).child("Sin cambios locales ✓"));
+            list = list.child(div().p_3().text_color(color::dim()).child("No local changes ✓"));
         } else {
             for entry in &self.status {
                 let path = entry.path.clone();
@@ -737,7 +792,7 @@ impl RebasedApp {
 
         // diff del working tree del archivo seleccionado (virtualizado)
         let diff_area = if self.wt_rows.is_empty() {
-            div().flex_1().min_h_0().p_3().text_color(color::dim()).child("Seleccioná un archivo para ver su diff").into_any_element()
+            div().flex_1().min_h_0().p_3().text_color(color::dim()).child("Select a file to view its diff").into_any_element()
         } else {
             let n = self.wt_rows.len();
             div()
@@ -786,7 +841,7 @@ impl RebasedApp {
                     .text_xs()
                     .text_color(if self.commit_msg.is_empty() { color::dim() } else { color::fg() })
                     .child(if self.commit_msg.is_empty() {
-                        "Mensaje de commit… (clic para escribir)".to_string()
+                        "Commit message… (click to type)".to_string()
                     } else {
                         self.commit_msg.clone()
                     }),
@@ -849,7 +904,7 @@ impl RebasedApp {
                     )
                     .child(btn(&format!("co-{name}"), "checkout", move |app| { let n = n1.clone(); e1.update(app, |t, cx| t.do_checkout(n, cx)); }))
                     .child(btn(&format!("mg-{name}"), "merge", move |app| { let n = n2.clone(); e2.update(app, |t, cx| t.do_merge(n, cx)); }))
-                    .child(btn(&format!("rm-{name}"), "borrar", move |app| { let n = n3.clone(); e3.update(app, |t, cx| t.do_delete_branch(n, cx)); })),
+                    .child(btn(&format!("rm-{name}"), "delete", move |app| { let n = n3.clone(); e3.update(app, |t, cx| t.do_delete_branch(n, cx)); })),
             );
         }
 
@@ -881,12 +936,12 @@ impl RebasedApp {
                     .text_xs()
                     .text_color(if self.new_branch.is_empty() { color::dim() } else { color::fg() })
                     .child(if self.new_branch.is_empty() {
-                        "nueva rama… (Enter para crear)".to_string()
+                        "new branch… (Enter to create)".to_string()
                     } else {
                         self.new_branch.clone()
                     }),
             )
-            .child(btn("create-br", "Crear", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.do_create_branch(cx)); } }));
+            .child(btn("create-br", "Create", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.do_create_branch(cx)); } }));
 
         div().flex().flex_col().flex_1().min_h_0().child(list).child(create).into_any_element()
     }
@@ -958,13 +1013,13 @@ impl RebasedApp {
                     .whitespace_nowrap()
                     .text_ellipsis()
                     .child(format!(
-                        "base {} · {} pasos · clic en la acción cicla pick→squash→fixup→drop",
+                        "base {} · {} steps · click the action to cycle pick→squash→fixup→drop",
                         short(&plan.base),
                         plan.steps.len()
                     )),
             )
-            .child(btn("rb-apply", "Aplicar rebase", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.apply_rebase(cx)); } }))
-            .child(btn("rb-cancel", "Cancelar", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.cancel_rebase(cx)); } }));
+            .child(btn("rb-apply", "Apply rebase", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.apply_rebase(cx)); } }))
+            .child(btn("rb-cancel", "Cancel", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.cancel_rebase(cx)); } }));
 
         div()
             .flex()
@@ -980,7 +1035,7 @@ impl RebasedApp {
                     .border_b_1()
                     .border_color(color::line())
                     .text_color(color::accent())
-                    .child("Rebase interactivo 🎯 — arriba = más antiguo"),
+                    .child("Interactive rebase 🎯 — top = oldest"),
             )
             .child(list)
             .child(footer)
@@ -1099,7 +1154,7 @@ impl RebasedApp {
             };
 
             let body = if bv.loading {
-                div().flex_1().p_3().text_color(color::dim()).child("Cargando blame…").into_any_element()
+                div().flex_1().p_3().text_color(color::dim()).child("Loading blame…").into_any_element()
             } else if let Some(err) = &bv.error {
                 div().flex_1().p_3().text_color(color::err()).child(err.clone()).into_any_element()
             } else {
@@ -1143,7 +1198,7 @@ impl RebasedApp {
                     .text_sm()
                     .child(div().font_family("Menlo").text_color(color::accent()).child(short))
                     .child(div().flex_1().min_w_0().whitespace_nowrap().text_ellipsis().child(c.summary.clone()))
-                    .child(btn("rb-from", "⤵ rebase i.", {
+                    .child(btn("rb-from", "⤵ rebase", {
                         let e = cx.entity();
                         move |app| {
                             e.update(app, |t, cx| t.start_rebase(ix, cx));
@@ -1157,13 +1212,13 @@ impl RebasedApp {
                 .bg(color::panel())
                 .text_sm()
                 .text_color(color::dim())
-                .child("Selecciona un commit para ver su diff"),
+                .child("Select a commit to view its diff"),
         };
 
         let body = if let Some(err) = &self.diff_error {
             div().flex_1().p_3().text_color(color::err()).child(err.clone()).into_any_element()
         } else if self.diff_rows.is_empty() {
-            div().flex_1().p_3().text_color(color::dim()).child("Sin cambios en este commit").into_any_element()
+            div().flex_1().p_3().text_color(color::dim()).child("No changes in this commit").into_any_element()
         } else {
             let entity = cx.entity();
             let n = self.diff_rows.len();
@@ -1328,7 +1383,17 @@ fn commit_row(
         .child(
             div()
                 .flex_none()
-                .w(px(72.0))
+                .w(px(88.0))
+                .whitespace_nowrap()
+                .font_family("Menlo")
+                .text_color(color::dim())
+                .text_sm()
+                .child(fmt_date(c.time)),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(68.0))
                 .whitespace_nowrap()
                 .font_family("Menlo")
                 .text_color(color::dim())
@@ -1398,7 +1463,7 @@ fn main() {
                 .clamp(1, MAX_LANES);
             (commits, graph, width, None)
         }
-        Err(e) => (Vec::new(), Vec::new(), 1, Some(format!("No se pudo abrir el repo: {e}"))),
+        Err(e) => (Vec::new(), Vec::new(), 1, Some(format!("Could not open repo: {e}"))),
     };
 
     // Precalentar el diff del commit más reciente: deja el cache del repo gix
