@@ -144,9 +144,35 @@ fn commit_row(c: &CommitInfo, g: &RowGraph, graph_width: usize) -> impl IntoElem
         .border_b_1()
         .border_color(color::row_line())
         .child(graph_gutter(g, graph_width))
-        .child(div().flex_1().text_color(color::fg()).child(truncate(&c.summary, 90)))
-        .child(div().flex_none().text_color(color::dim()).text_sm().child(c.author.clone()))
-        .child(div().flex_none().w(px(64.0)).text_color(color::dim()).text_sm().child(short_id))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_color(color::fg())
+                .child(truncate(&c.summary, 120)),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(150.0))
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_color(color::dim())
+                .text_sm()
+                .child(c.author.clone()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(72.0))
+                .whitespace_nowrap()
+                .font_family("Menlo")
+                .text_color(color::dim())
+                .text_sm()
+                .child(short_id),
+        )
 }
 
 fn truncate(s: &str, n: usize) -> String {
