@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+pub mod blame;
 pub mod diff;
 pub mod graph;
 
