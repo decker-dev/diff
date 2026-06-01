@@ -7,6 +7,8 @@
 
 use std::path::Path;
 
+pub mod graph;
+
 pub use git2::Error;
 
 /// Un repositorio git abierto.
