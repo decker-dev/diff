@@ -10,6 +10,7 @@ use std::path::Path;
 pub mod blame;
 pub mod diff;
 pub mod graph;
+pub mod rebase;
 
 pub use git2::Error;
 
@@ -292,6 +293,22 @@ impl Repo {
             .flatten()
             .map(str::to_string)
             .collect())
+    }
+
+    // ---- Rebase (área Rebase 🎯) ----
+
+    /// Ejecuta un plan de rebase interactivo sobre `base` (pick/reword/squash/fixup/drop).
+    pub fn rebase_interactive(
+        &self,
+        base: &str,
+        steps: &[rebase::RebaseStep],
+    ) -> Result<rebase::RebaseResult, Error> {
+        rebase::run_interactive(&self.inner, base, steps)
+    }
+
+    /// Rebase de la rama actual sobre la punta de `upstream`.
+    pub fn rebase_onto(&self, upstream: &str) -> Result<rebase::RebaseResult, Error> {
+        rebase::rebase_onto(&self.inner, upstream)
     }
 }
 

@@ -4,6 +4,7 @@
 //!
 //! Uso:  cargo run -p app --example selftest --release -- [repo-grande]
 
+use git_core::rebase::{RebaseAction, RebaseResult, RebaseStep};
 use std::fs;
 use std::process::Command;
 use std::time::Instant;
@@ -85,6 +86,79 @@ fn main() {
         Ok(msg) => println!("  ✓ {msg}"),
         Err(e) => println!("  ✗ FALLO: {e}"),
     }
+
+    println!("\n  -- M6: rebase interactivo (squash / drop) --");
+    match test_rebase() {
+        Ok(msg) => println!("  ✓ {msg}"),
+        Err(e) => println!("  ✗ FALLO: {e}"),
+    }
+}
+
+/// Crea un repo temporal con commits A, B, C (archivos distintos para no chocar).
+/// Devuelve (repo, dir, id_A, id_B, id_C).
+fn build_abc(name: &str) -> Result<(git_core::Repo, std::path::PathBuf, String, String, String), String> {
+    let dir = std::env::temp_dir().join(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.to_string_lossy().to_string();
+    let git = |args: &[&str]| {
+        Command::new("git").arg("-C").arg(&path).args(args).output().ok();
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@rebased.rs"]);
+    git(&["config", "user.name", "t"]);
+    let repo = git_core::Repo::open(&path).map_err(es)?;
+
+    let commit_file = |f: &str, msg: &str| -> Result<String, String> {
+        fs::write(dir.join(f), format!("{f}\n")).map_err(|e| e.to_string())?;
+        repo.stage(f).map_err(es)?;
+        repo.commit(msg).map_err(es)?;
+        Ok(git_core::gix_log(&path, 1).map_err(|e| e.to_string())?[0].id.clone())
+    };
+    let a = commit_file("a.txt", "A")?;
+    let b = commit_file("b.txt", "B")?;
+    let c = commit_file("c.txt", "C")?;
+    drop(commit_file);
+    Ok((repo, dir, a, b, c))
+}
+
+/// Verifica el rebase interactivo: squash (3 commits → 2) y drop (saca C).
+fn test_rebase() -> Result<String, String> {
+    let step = |id: &str, action: RebaseAction| RebaseStep {
+        commit: id.to_string(),
+        action,
+    };
+
+    // SQUASH: base A, pick B, squash C  →  A + (B+C)
+    let (repo, dir, a, b, c) = build_abc("rebased-rs-rb-sq")?;
+    let res = repo
+        .rebase_interactive(&a, &[step(&b, RebaseAction::Pick), step(&c, RebaseAction::Squash)])
+        .map_err(es)?;
+    if !matches!(res, RebaseResult::Done(_)) {
+        return Err(format!("squash: {res:?}"));
+    }
+    let log = git_core::gix_log(&dir.to_string_lossy(), 10).map_err(|e| e.to_string())?;
+    if log.len() != 2 {
+        return Err(format!("squash: esperaba 2 commits, hay {}", log.len()));
+    }
+    if !dir.join("b.txt").exists() || !dir.join("c.txt").exists() {
+        return Err("squash: faltan b.txt/c.txt".into());
+    }
+
+    // DROP: base A, pick B, drop C  →  A + B (sin c.txt)
+    let (repo2, dir2, a2, b2, c2) = build_abc("rebased-rs-rb-dr")?;
+    let res2 = repo2
+        .rebase_interactive(&a2, &[step(&b2, RebaseAction::Pick), step(&c2, RebaseAction::Drop)])
+        .map_err(es)?;
+    if !matches!(res2, RebaseResult::Done(_)) {
+        return Err(format!("drop: {res2:?}"));
+    }
+    let log2 = git_core::gix_log(&dir2.to_string_lossy(), 10).map_err(|e| e.to_string())?;
+    if log2.len() != 2 || !dir2.join("b.txt").exists() || dir2.join("c.txt").exists() {
+        return Err(format!("drop: len={} (esperaba 2), c.txt no debería existir", log2.len()));
+    }
+
+    Ok("squash (3→2, b+c fundidos) + drop (C fuera) OK".into())
 }
 
 /// Verifica el ciclo de ramas: crear, checkout, commit, merge fast-forward, borrar.
