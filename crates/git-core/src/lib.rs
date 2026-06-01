@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+pub mod diff;
 pub mod graph;
 
 pub use git2::Error;
@@ -103,6 +104,11 @@ impl Repo {
             });
         }
         Ok(out)
+    }
+
+    /// Diff de un commit contra su primer padre (o el árbol vacío si es root).
+    pub fn commit_diff(&self, commit_id: &str) -> Result<Vec<diff::FileDiff>, Error> {
+        diff::commit_diff(&self.inner, commit_id)
     }
 }
 
