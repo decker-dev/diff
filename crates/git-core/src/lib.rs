@@ -106,6 +106,54 @@ impl Repo {
         }
         Ok(out)
     }
+
+    /// Añade un archivo al index (stage). Maneja modificados/nuevos y borrados.
+    pub fn stage(&self, path: &str) -> Result<(), Error> {
+        let mut index = self.inner.index()?;
+        let exists = self
+            .inner
+            .workdir()
+            .map(|w| w.join(path).exists())
+            .unwrap_or(false);
+        if exists {
+            index.add_path(Path::new(path))?;
+        } else {
+            index.remove_path(Path::new(path))?; // archivo borrado
+        }
+        index.write()
+    }
+
+    /// Quita un archivo del index (unstage): lo devuelve al estado de HEAD.
+    pub fn unstage(&self, path: &str) -> Result<(), Error> {
+        match self.inner.head() {
+            Ok(head) => {
+                let obj = head.peel(git2::ObjectType::Commit)?;
+                self.inner.reset_default(Some(&obj), [path])?;
+            }
+            Err(_) => {
+                // Repo sin commits aún: simplemente quitar del index.
+                let mut index = self.inner.index()?;
+                index.remove_path(Path::new(path))?;
+                index.write()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Crea un commit con lo que haya en el index. Devuelve el hash.
+    pub fn commit(&self, message: &str) -> Result<String, Error> {
+        let sig = self.inner.signature()?;
+        let mut index = self.inner.index()?;
+        let tree = self.inner.find_tree(index.write_tree()?)?;
+        let oid = match self.inner.head().and_then(|h| h.peel_to_commit()) {
+            Ok(parent) => {
+                self.inner
+                    .commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])?
+            }
+            Err(_) => self.inner.commit(Some("HEAD"), &sig, &sig, message, &tree, &[])?,
+        };
+        Ok(oid.to_string())
+    }
 }
 
 /// `log` vía **gitoxide (gix)** — el motor candidato para las rutas calientes.
