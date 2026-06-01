@@ -1,0 +1,8 @@
+[package]
+name = "git-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+git2 = { workspace = true }
+gix = "0.84.0"

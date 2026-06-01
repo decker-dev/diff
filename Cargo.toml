@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/git-core", "crates/app"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+
+[workspace.dependencies]
+# Base correcta y verificable sobre libgit2. Sin features de red (https/ssh)
+# todavía: solo operaciones locales (log, status, diff), que es lo que pide M0.
+# Esto evita compilar openssl/libssh2 y acelera el build.
+git2 = { version = "0.19", default-features = false }
+
+# Perfil de release con optimización agresiva: la tesis del proyecto es velocidad.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

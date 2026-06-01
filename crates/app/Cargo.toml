@@ -1,0 +1,12 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rebased-rs"
+path = "src/main.rs"
+
+[dependencies]
+git-core = { path = "../git-core" }
+gpui = "0.2.2"
