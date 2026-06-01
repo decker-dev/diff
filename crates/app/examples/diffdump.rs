@@ -1,41 +1,33 @@
-//! Vuelca el diff de un commit (HEAD por defecto) para verificar el motor de diff.
-//! Uso:  cargo run -p app --example diffdump -- [ruta-repo] [commit-id]
+//! Mide y vuelca el diff de commits para diagnosticar el rendimiento del clic.
+//! Uso:  cargo run -p app --example diffdump --release -- [ruta-repo]
 
-use git_core::diff::LineOrigin;
+use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).unwrap_or_else(|| ".".into());
-    let repo = git_core::Repo::open(&path)?;
+    let head = git_core::gix_log(&path, 8)?;
 
-    let commit = match std::env::args().nth(2) {
-        Some(c) => c,
-        None => git_core::gix_log(&path, 1)?
-            .first()
-            .map(|c| c.id.clone())
-            .ok_or("repo vacío")?,
-    };
+    println!("== commit_diff (gix tree-diff + git2 buffers) — lo de cada clic ==\n");
+    for (i, c) in head.iter().enumerate() {
+        let t = Instant::now();
+        let files = git_core::diff::commit_diff(&path, &c.id)?;
+        let dt = t.elapsed();
 
-    let files = repo.commit_diff(&commit)?;
-    println!("diff de {}  →  {} archivos cambiados", &commit[..12.min(commit.len())], files.len());
-
-    for f in &files {
-        let (add, del) = f.line_stats();
-        let rename = f
-            .old_path
-            .as_ref()
-            .map(|o| format!("  ({o} →)"))
-            .unwrap_or_default();
-        let bin = if f.binary { "  [binario]" } else { "" };
-        println!("\n  {:?}  {}  (+{add} -{del}){rename}{bin}", f.status, f.path);
-        if let Some(h) = f.hunks.first() {
-            println!("    {}", h.header);
-            for l in h.lines.iter().take(6) {
-                let sign = match l.origin {
-                    LineOrigin::Add => '+',
-                    LineOrigin::Del => '-',
-                    LineOrigin::Context => ' ',
-                };
-                println!("    {sign}{}", l.content);
+        let lines: usize = files
+            .iter()
+            .map(|f| f.hunks.iter().map(|h| h.lines.len()).sum::<usize>())
+            .sum();
+        println!(
+            "  #{i} {}  diff={:>8.2?}  ({} archivos, {} líneas)",
+            &c.id[..8],
+            dt,
+            files.len(),
+            lines
+        );
+        if i == 0 {
+            for f in files.iter().take(3) {
+                let (a, d) = f.line_stats();
+                println!("       {:?} {} (+{a} -{d})", f.status, f.path);
             }
         }
     }

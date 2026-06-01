@@ -63,14 +63,14 @@ impl RebasedApp {
         }
         self.selected = Some(ix);
         let id = self.commits[ix].id.clone();
-        match git_core::Repo::open(&self.repo_path).and_then(|r| r.commit_diff(&id)) {
+        match git_core::diff::commit_diff(&self.repo_path, &id) {
             Ok(files) => {
                 self.diff = files;
                 self.diff_error = None;
             }
             Err(e) => {
                 self.diff.clear();
-                self.diff_error = Some(e.to_string());
+                self.diff_error = Some(e);
             }
         }
         cx.notify();

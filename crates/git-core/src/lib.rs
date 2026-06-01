@@ -105,11 +105,6 @@ impl Repo {
         }
         Ok(out)
     }
-
-    /// Diff de un commit contra su primer padre (o el árbol vacío si es root).
-    pub fn commit_diff(&self, commit_id: &str) -> Result<Vec<diff::FileDiff>, Error> {
-        diff::commit_diff(&self.inner, commit_id)
-    }
 }
 
 /// `log` vía **gitoxide (gix)** — el motor candidato para las rutas calientes.
