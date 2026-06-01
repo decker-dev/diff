@@ -3,6 +3,7 @@
 //!
 //! Uso:  rebased-rs [ruta-al-repo] [limit]   (por defecto: . y 50000)
 
+use git_core::blame::BlameLine;
 use git_core::diff::{FileDiff, LineOrigin};
 use git_core::graph::{compute_graph, RowGraph};
 use git_core::CommitInfo;
@@ -44,6 +45,13 @@ fn branch_color(c: u32) -> Rgba {
     rgb(P[(c as usize) % P.len()])
 }
 
+/// Anotación de un archivo (modo blame del panel inferior).
+struct BlameView {
+    file: String,
+    lines: Vec<BlameLine>,
+    error: Option<String>,
+}
+
 struct RebasedApp {
     repo_path: String,
     commits: Vec<CommitInfo>,
@@ -53,6 +61,8 @@ struct RebasedApp {
     selected: Option<usize>,
     diff: Vec<FileDiff>,
     diff_error: Option<String>,
+    /// Si está `Some`, el panel inferior muestra blame en vez del diff.
+    blame: Option<BlameView>,
 }
 
 impl RebasedApp {
@@ -62,6 +72,7 @@ impl RebasedApp {
             return;
         }
         self.selected = Some(ix);
+        self.blame = None; // al cambiar de commit, volvemos a vista de diff
         let id = self.commits[ix].id.clone();
         match git_core::diff::commit_diff(&self.repo_path, &id) {
             Ok(files) => {
@@ -73,6 +84,24 @@ impl RebasedApp {
                 self.diff_error = Some(e);
             }
         }
+        cx.notify();
+    }
+
+    /// Muestra el blame de `file` tal como está en el commit seleccionado.
+    fn show_blame(&mut self, file: String, cx: &mut Context<Self>) {
+        let Some(ix) = self.selected else { return };
+        let id = self.commits[ix].id.clone();
+        let blame = match git_core::blame::blame_file(&self.repo_path, &id, &file) {
+            Ok(lines) => BlameView { file, lines, error: None },
+            Err(e) => BlameView { file, lines: Vec::new(), error: Some(e) },
+        };
+        self.blame = Some(blame);
+        cx.notify();
+    }
+
+    /// Vuelve del modo blame a la vista de diff.
+    fn clear_blame(&mut self, cx: &mut Context<Self>) {
+        self.blame = None;
         cx.notify();
     }
 }
@@ -134,13 +163,18 @@ impl Render for RebasedApp {
             .text_color(color::fg())
             .child(header)
             .child(log)
-            .child(self.render_diff_panel())
+            .child(self.render_diff_panel(cx.entity()))
     }
 }
 
 impl RebasedApp {
-    /// Panel inferior con el diff del commit seleccionado.
-    fn render_diff_panel(&self) -> impl IntoElement {
+    /// Panel inferior: diff del commit, o blame de un archivo si está activo.
+    fn render_diff_panel(&self, entity: Entity<RebasedApp>) -> gpui::AnyElement {
+        // Modo blame: el panel muestra la anotación del archivo elegido.
+        if let Some(bv) = &self.blame {
+            return self.render_blame(bv, entity).into_any_element();
+        }
+
         let head = match self.selected {
             Some(ix) => {
                 let c = &self.commits[ix];
@@ -181,16 +215,25 @@ impl RebasedApp {
                 .font_family("Menlo")
                 .text_xs();
             let mut budget = DIFF_LINE_BUDGET;
-            for f in &self.diff {
+            for (i, f) in self.diff.iter().enumerate() {
                 let (add, del) = f.line_stats();
+                let e = entity.clone();
+                let fname = f.path.clone();
                 body = body.child(
                     div()
+                        .id(i)
                         .w_full()
                         .px_3()
                         .py_1()
                         .bg(color::panel())
                         .text_color(color::fg())
-                        .child(format!("{}   +{add} −{del}{}", f.path, if f.binary { "  [binario]" } else { "" })),
+                        .cursor_pointer()
+                        .hover(|s| s.bg(color::hover()))
+                        .on_click(move |_, _, app| {
+                            let f = fname.clone();
+                            e.update(app, |t, cx| t.show_blame(f, cx));
+                        })
+                        .child(format!("{}   +{add} −{del}{}   ⟶ blame", f.path, if f.binary { "  [binario]" } else { "" })),
                 );
                 for h in &f.hunks {
                     body = body.child(div().w_full().px_3().text_color(color::dim()).child(h.header.clone()));
@@ -219,6 +262,91 @@ impl RebasedApp {
                 body = body.child(div().px_3().py_1().text_color(color::dim()).child("… diff truncado"));
             }
             body.into_any_element()
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .h(px(340.0))
+            .border_t_1()
+            .border_color(color::line())
+            .bg(color::bg())
+            .child(head)
+            .child(content)
+            .into_any_element()
+    }
+
+    /// Panel de blame: cabecera con "← diff" + líneas anotadas (línea · commit · autor · texto).
+    fn render_blame(&self, bv: &BlameView, entity: Entity<RebasedApp>) -> impl IntoElement {
+        let back = {
+            let e = entity.clone();
+            div()
+                .id("blame-back")
+                .px_2()
+                .cursor_pointer()
+                .text_color(color::accent())
+                .hover(|s| s.bg(color::hover()))
+                .on_click(move |_, _, app| e.update(app, |t, cx| t.clear_blame(cx)))
+                .child("← diff")
+        };
+        let head = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_3()
+            .py_1()
+            .bg(color::panel())
+            .text_sm()
+            .child(back)
+            .child(div().font_family("Menlo").child(bv.file.clone()))
+            .child(div().text_color(color::dim()).child("· blame"));
+
+        let content = if let Some(err) = &bv.error {
+            div().p_3().text_color(color::err()).child(err.clone()).into_any_element()
+        } else {
+            let mut b = div()
+                .id("blame-body")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .overflow_y_scroll()
+                .font_family("Menlo")
+                .text_xs();
+            for l in bv.lines.iter().take(5000) {
+                b = b.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .w_full()
+                        .px_3()
+                        .child(div().flex_none().w(px(44.0)).text_color(color::dim()).child(format!("{}", l.line_no)))
+                        .child(div().flex_none().w(px(64.0)).text_color(color::accent()).child(l.commit.clone()))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(110.0))
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_color(color::dim())
+                                .child(l.author.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .whitespace_nowrap()
+                                .text_color(color::fg())
+                                .child(l.content.clone()),
+                        ),
+                );
+            }
+            b.into_any_element()
         };
 
         div()
@@ -387,6 +515,7 @@ fn main() {
                     selected,
                     diff,
                     diff_error: None,
+                    blame: None,
                 })
             },
         )
