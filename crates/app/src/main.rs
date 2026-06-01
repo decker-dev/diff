@@ -6,10 +6,10 @@
 use git_core::blame::BlameLine;
 use git_core::diff::{FileDiff, LineOrigin};
 use git_core::graph::{compute_graph, RowGraph};
-use git_core::CommitInfo;
+use git_core::{BranchInfo, CommitInfo, StatusEntry};
 use gpui::{
-    div, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds, Context, Entity, Rgba,
-    SharedString, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds, Context, Entity,
+    FocusHandle, KeyDownEvent, Rgba, SharedString, Window, WindowBounds, WindowOptions,
 };
 
 const ROW_H: f32 = 24.0;
@@ -36,6 +36,17 @@ mod color {
     pub fn add_fg() -> Rgba { rgb(0xa9c77d) }
     pub fn del_bg() -> Rgba { rgb(0x33232a) }
     pub fn del_fg() -> Rgba { rgb(0xe06c75) }
+    pub fn ok() -> Rgba { rgb(0x59a869) }
+    pub fn btn() -> Rgba { rgb(0x3c3f43) }
+    pub fn tab_active() -> Rgba { rgb(0x1e1f22) }
+}
+
+/// Vistas principales de la app (pestañas).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Log,
+    Changes,
+    Branches,
 }
 
 /// Colores de rama del graph (se ciclan por índice de lane).
@@ -96,6 +107,25 @@ struct RebasedApp {
     diff_error: Option<String>,
     /// Si está `Some`, el panel inferior muestra blame en vez del diff.
     blame: Option<BlameView>,
+
+    // ---- Vistas / navegación ----
+    view: ViewMode,
+    /// Toast con el resultado de la última operación (commit, push, etc.).
+    op_msg: Option<String>,
+
+    // ---- Cambios Locales (M4) ----
+    status: Vec<StatusEntry>,
+    status_error: Option<String>,
+    /// Diff (working tree) del archivo de cambios seleccionado.
+    wt_rows: Vec<DiffRow>,
+    wt_file: Option<String>,
+    commit_msg: String,
+    commit_focus: FocusHandle,
+
+    // ---- Ramas (M5) ----
+    branches: Vec<BranchInfo>,
+    new_branch: String,
+    branch_focus: FocusHandle,
 }
 
 impl RebasedApp {
@@ -164,56 +194,269 @@ impl RebasedApp {
         self.blame = None;
         cx.notify();
     }
+
+    // ---- Navegación entre vistas ----
+    fn set_view(&mut self, view: ViewMode, cx: &mut Context<Self>) {
+        self.view = view;
+        self.op_msg = None;
+        match view {
+            ViewMode::Changes => self.refresh_status(cx),
+            ViewMode::Branches => self.refresh_branches(cx),
+            ViewMode::Log => cx.notify(),
+        }
+    }
+
+    // ---- Cambios Locales (M4) ----
+    fn refresh_status(&mut self, cx: &mut Context<Self>) {
+        match git_core::Repo::open(&self.repo_path).and_then(|r| r.status()) {
+            Ok(s) => {
+                self.status = s;
+                self.status_error = None;
+            }
+            Err(e) => {
+                self.status.clear();
+                self.status_error = Some(e.to_string());
+            }
+        }
+        if let Some(f) = self.wt_file.clone() {
+            self.load_wt_diff(f);
+        }
+        cx.notify();
+    }
+
+    fn load_wt_diff(&mut self, path: String) {
+        let unstaged = git_core::diff::workdir_diff(&self.repo_path, false).unwrap_or_default();
+        let staged = git_core::diff::workdir_diff(&self.repo_path, true).unwrap_or_default();
+        let found = unstaged.iter().chain(staged.iter()).find(|f| f.path == path);
+        self.wt_rows = found
+            .map(|f| build_diff_rows(std::slice::from_ref(f)))
+            .unwrap_or_default();
+        self.wt_file = Some(path);
+    }
+
+    fn select_wt_file(&mut self, path: String, cx: &mut Context<Self>) {
+        self.load_wt_diff(path);
+        cx.notify();
+    }
+
+    fn toggle_stage(&mut self, path: String, staged: bool, cx: &mut Context<Self>) {
+        let r = git_core::Repo::open(&self.repo_path).and_then(|repo| {
+            if staged {
+                repo.unstage(&path)
+            } else {
+                repo.stage(&path)
+            }
+        });
+        if let Err(e) = r {
+            self.op_msg = Some(format!("✗ {e}"));
+        }
+        self.refresh_status(cx);
+    }
+
+    fn do_commit(&mut self, amend: bool, cx: &mut Context<Self>) {
+        let msg = self.commit_msg.trim().to_string();
+        if msg.is_empty() && !amend {
+            self.op_msg = Some("Escribí un mensaje de commit".into());
+            cx.notify();
+            return;
+        }
+        let r = git_core::Repo::open(&self.repo_path).and_then(|repo| {
+            if amend {
+                repo.amend(&msg)
+            } else {
+                repo.commit(&msg)
+            }
+        });
+        match r {
+            Ok(id) => {
+                self.op_msg = Some(format!("✓ commit {}", short(&id)));
+                self.commit_msg.clear();
+                self.reload_log();
+            }
+            Err(e) => self.op_msg = Some(format!("✗ {e}")),
+        }
+        self.refresh_status(cx);
+    }
+
+    fn on_commit_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        edit_key(&mut self.commit_msg, ev, true);
+        cx.notify();
+    }
+
+    // ---- Ramas (M5) ----
+    fn refresh_branches(&mut self, cx: &mut Context<Self>) {
+        match git_core::Repo::open(&self.repo_path).and_then(|r| r.branches()) {
+            Ok(b) => self.branches = b,
+            Err(e) => self.op_msg = Some(format!("✗ {e}")),
+        }
+        cx.notify();
+    }
+
+    fn branch_op(&mut self, r: Result<String, git_core::Error>, cx: &mut Context<Self>) {
+        self.op_msg = Some(match r {
+            Ok(m) => format!("✓ {m}"),
+            Err(e) => format!("✗ {e}"),
+        });
+        self.reload_log();
+        self.refresh_branches(cx);
+    }
+
+    fn do_checkout(&mut self, name: String, cx: &mut Context<Self>) {
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|repo| repo.checkout_branch(&name))
+            .map(|_| format!("checkout {name}"));
+        self.branch_op(r, cx);
+    }
+
+    fn do_merge(&mut self, name: String, cx: &mut Context<Self>) {
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|repo| repo.merge_branch(&name))
+            .map(|o| format!("merge {name}: {o:?}"));
+        self.branch_op(r, cx);
+    }
+
+    fn do_delete_branch(&mut self, name: String, cx: &mut Context<Self>) {
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|repo| repo.delete_branch(&name))
+            .map(|_| format!("borrada {name}"));
+        self.branch_op(r, cx);
+    }
+
+    fn do_create_branch(&mut self, cx: &mut Context<Self>) {
+        let name = self.new_branch.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        self.new_branch.clear();
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|repo| repo.create_branch(&name))
+            .map(|_| format!("creada {name}"));
+        self.branch_op(r, cx);
+    }
+
+    fn on_branch_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        if ev.keystroke.key == "enter" {
+            self.do_create_branch(cx);
+            return;
+        }
+        edit_key(&mut self.new_branch, ev, false);
+        cx.notify();
+    }
+
+    /// Recarga el log tras una operación que pudo cambiar HEAD.
+    fn reload_log(&mut self) {
+        if let Ok(commits) = git_core::gix_log(&self.repo_path, 50_000) {
+            self.graph = compute_graph(&commits);
+            self.graph_width = self
+                .graph
+                .iter()
+                .map(|r| r.width())
+                .max()
+                .unwrap_or(1)
+                .clamp(1, MAX_LANES);
+            self.commits = commits;
+        }
+    }
+
+    // ---- Remoto (M7) / Stash (M8) ----
+    /// Ejecuta una operación de red en background (no congela la UI).
+    fn run_remote(&mut self, op: &'static str, cx: &mut Context<Self>) {
+        self.op_msg = Some(format!("{op}…"));
+        cx.notify();
+        let path = self.repo_path.clone();
+        let branch = self
+            .branches
+            .iter()
+            .find(|b| b.is_head)
+            .map(|b| b.name.clone())
+            .unwrap_or_else(|| "HEAD".into());
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    let repo = git_core::Repo::open(&path).map_err(|e| e.to_string())?;
+                    match op {
+                        "fetch" => repo.fetch("origin"),
+                        "pull" => repo.pull(),
+                        "push" => repo.push("origin", &branch),
+                        _ => Ok(String::new()),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.op_msg = Some(match res {
+                    Ok(o) => format!("✓ {op}: {}", first_line(&o)),
+                    Err(e) => format!("✗ {op}: {}", first_line(&e)),
+                });
+                this.reload_log();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn do_stash(&mut self, cx: &mut Context<Self>) {
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|mut repo| repo.stash_save("WIP (rebased-rs)"));
+        self.op_msg = Some(match r {
+            Ok(id) => format!("✓ stash {}", short(&id)),
+            Err(e) => format!("✗ {e}"),
+        });
+        self.refresh_status(cx);
+    }
+}
+
+/// Aplica una tecla a un buffer de texto (input minimalista).
+fn edit_key(buf: &mut String, ev: &KeyDownEvent, multiline: bool) {
+    match ev.keystroke.key.as_str() {
+        "backspace" => {
+            buf.pop();
+        }
+        "enter" => {
+            if multiline {
+                buf.push('\n');
+            }
+        }
+        "space" => buf.push(' '),
+        _ => {
+            if let Some(c) = &ev.keystroke.key_char {
+                let m = &ev.keystroke.modifiers;
+                if !c.is_empty() && !m.platform && !m.control {
+                    buf.push_str(c);
+                }
+            }
+        }
+    }
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().find(|l| !l.trim().is_empty()).unwrap_or("ok").to_string()
+}
+
+fn short(id: &str) -> String {
+    id.get(..7).unwrap_or(id).to_string()
 }
 
 impl Render for RebasedApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let header = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .w_full()
-            .h(px(38.0))
-            .px_3()
-            .bg(color::panel())
-            .border_b_1()
-            .border_color(color::line())
-            .child(div().text_color(color::accent()).child("rebased-rs"))
-            .child(div().text_color(color::dim()).text_sm().child(self.repo_path.clone()))
-            .child(
-                div()
-                    .text_color(color::dim())
-                    .text_sm()
-                    .child(format!("· {} commits", self.commits.len())),
-            );
-
-        let entity = cx.entity();
-        let log = match &self.error {
-            Some(e) => div().flex_1().p_3().text_color(color::err()).child(e.clone()),
-            None => div().flex_1().min_h_0().child(
-                uniform_list(
-                    "commit-log",
-                    self.commits.len(),
-                    cx.processor(move |this, range: std::ops::Range<usize>, _window, _cx| {
-                        range
-                            .map(|ix| {
-                                let selected = this.selected == Some(ix);
-                                commit_row(
-                                    &this.commits[ix],
-                                    &this.graph[ix],
-                                    this.graph_width,
-                                    ix,
-                                    selected,
-                                    entity.clone(),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    }),
-                )
-                .size_full(),
-            ),
+        let toolbar = self.render_toolbar(cx);
+        let body = match self.view {
+            ViewMode::Log => self.render_log(cx),
+            ViewMode::Changes => self.render_changes(cx),
+            ViewMode::Branches => self.render_branches(cx),
         };
+        let toast = self.op_msg.clone().map(|m| {
+            div()
+                .w_full()
+                .px_3()
+                .py_1()
+                .bg(color::panel())
+                .border_t_1()
+                .border_color(color::line())
+                .text_sm()
+                .text_color(color::dim())
+                .child(m)
+        });
 
         div()
             .flex()
@@ -221,9 +464,387 @@ impl Render for RebasedApp {
             .size_full()
             .bg(color::bg())
             .text_color(color::fg())
-            .child(header)
+            .child(toolbar)
+            .child(body)
+            .children(toast)
+    }
+}
+
+impl RebasedApp {
+    /// Barra superior: pestañas (Log/Cambios/Ramas) + acciones de red/stash.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        let view = self.view;
+        let tab = {
+            let e = e.clone();
+            move |label: &str, mode: ViewMode| {
+                let e = e.clone();
+                let active = view == mode;
+                div()
+                    .id(SharedString::from(format!("tab-{label}")))
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_sm()
+                    .bg(if active { color::tab_active() } else { color::panel() })
+                    .text_color(if active { color::accent() } else { color::dim() })
+                    .hover(|s| s.bg(color::hover()))
+                    .on_click(move |_, _, app| {
+                        e.update(app, |t, cx| t.set_view(mode, cx));
+                    })
+                    .child(label.to_string())
+            }
+        };
+        let cur = self
+            .branches
+            .iter()
+            .find(|b| b.is_head)
+            .map(|b| b.name.clone())
+            .unwrap_or_default();
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .w_full()
+            .h(px(40.0))
+            .px_2()
+            .bg(color::panel())
+            .border_b_1()
+            .border_color(color::line())
+            .child(div().px_2().text_color(color::accent()).child("rebased-rs"))
+            .child(tab("Log", ViewMode::Log))
+            .child(tab("Cambios", ViewMode::Changes))
+            .child(tab("Ramas", ViewMode::Branches))
+            .child(div().flex_1().min_w_0().text_color(color::dim()).text_sm().px_2().whitespace_nowrap().text_ellipsis().child(if cur.is_empty() { String::new() } else { format!("⎇ {cur}") }))
+            .child(btn("tb-fetch", "Fetch", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.run_remote("fetch", cx)); } }))
+            .child(btn("tb-pull", "Pull", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.run_remote("pull", cx)); } }))
+            .child(btn("tb-push", "Push", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.run_remote("push", cx)); } }))
+            .child(btn("tb-stash", "Stash", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.do_stash(cx)); } }))
+            .into_any_element()
+    }
+
+    /// Vista Log (Historia): log graph virtualizado + panel diff/blame.
+    fn render_log(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let entity = cx.entity();
+        let log = match &self.error {
+            Some(e) => div().flex_1().p_3().text_color(color::err()).child(e.clone()).into_any_element(),
+            None => div()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    uniform_list(
+                        "commit-log",
+                        self.commits.len(),
+                        cx.processor(move |this, range: std::ops::Range<usize>, _w, _c| {
+                            range
+                                .map(|ix| {
+                                    commit_row(
+                                        &this.commits[ix],
+                                        &this.graph[ix],
+                                        this.graph_width,
+                                        ix,
+                                        this.selected == Some(ix),
+                                        entity.clone(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .size_full(),
+                )
+                .into_any_element(),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
             .child(log)
             .child(self.render_diff_panel(cx))
+            .into_any_element()
+    }
+
+    /// Vista Cambios Locales (M4): status + stage/unstage + diff WT + commit.
+    fn render_changes(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        let mut list = div()
+            .id("status-list")
+            .flex()
+            .flex_col()
+            .w_full()
+            .h(px(180.0))
+            .overflow_y_scroll()
+            .border_b_1()
+            .border_color(color::line());
+
+        if let Some(err) = &self.status_error {
+            list = list.child(div().p_3().text_color(color::err()).child(err.clone()));
+        } else if self.status.is_empty() {
+            list = list.child(div().p_3().text_color(color::dim()).child("Sin cambios locales ✓"));
+        } else {
+            for entry in &self.status {
+                let path = entry.path.clone();
+                let staged = entry.staged;
+                let (e1, p1) = (e.clone(), path.clone());
+                let (e2, p2) = (e.clone(), path.clone());
+                let selected = self.wt_file.as_deref() == Some(path.as_str());
+                list = list.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .w_full()
+                        .px_3()
+                        .h(px(22.0))
+                        .when(selected, |d| d.bg(color::sel()))
+                        .hover(|s| s.bg(color::hover()))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("ck-{path}")))
+                                .cursor_pointer()
+                                .text_color(if staged { color::ok() } else { color::dim() })
+                                .on_click(move |_, _, app| {
+                                    let p = p1.clone();
+                                    e1.update(app, |t, cx| t.toggle_stage(p, staged, cx));
+                                })
+                                .child(if staged { "[✓]" } else { "[ ]" }),
+                        )
+                        .child(div().flex_none().w(px(74.0)).text_xs().text_color(color::dim()).child(format!("{:?}", entry.state)))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("st-{path}")))
+                                .flex_1()
+                                .min_w_0()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .cursor_pointer()
+                                .text_color(color::fg())
+                                .on_click(move |_, _, app| {
+                                    let p = p2.clone();
+                                    e2.update(app, |t, cx| t.select_wt_file(p, cx));
+                                })
+                                .child(path.clone()),
+                        ),
+                );
+            }
+        }
+
+        // diff del working tree del archivo seleccionado (virtualizado)
+        let diff_area = if self.wt_rows.is_empty() {
+            div().flex_1().min_h_0().p_3().text_color(color::dim()).child("Seleccioná un archivo para ver su diff").into_any_element()
+        } else {
+            let n = self.wt_rows.len();
+            div()
+                .flex_1()
+                .min_h_0()
+                .font_family("Menlo")
+                .text_xs()
+                .child(
+                    uniform_list(
+                        "wt-rows",
+                        n,
+                        cx.processor(|this, range: std::ops::Range<usize>, _w, _c| {
+                            range.filter_map(|i| this.wt_rows.get(i).map(wt_row_el)).collect::<Vec<_>>()
+                        }),
+                    )
+                    .size_full(),
+                )
+                .into_any_element()
+        };
+
+        // caja de commit
+        let commit_box = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap_1()
+            .p_2()
+            .border_t_1()
+            .border_color(color::line())
+            .bg(color::panel())
+            .child(
+                div()
+                    .id("commit-input")
+                    .w_full()
+                    .h(px(54.0))
+                    .p_2()
+                    .bg(color::bg())
+                    .rounded_md()
+                    .border_1()
+                    .border_color(color::line())
+                    .track_focus(&self.commit_focus)
+                    .key_context("commit")
+                    .on_key_down(cx.listener(Self::on_commit_key))
+                    .on_click(cx.listener(|this, _, window, _| window.focus(&this.commit_focus)))
+                    .font_family("Menlo")
+                    .text_xs()
+                    .text_color(if self.commit_msg.is_empty() { color::dim() } else { color::fg() })
+                    .child(if self.commit_msg.is_empty() {
+                        "Mensaje de commit… (clic para escribir)".to_string()
+                    } else {
+                        self.commit_msg.clone()
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(btn("do-commit", "Commit", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.do_commit(false, cx)); } }))
+                    .child(btn("do-amend", "Amend", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.do_commit(true, cx)); } })),
+            );
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(list)
+            .child(diff_area)
+            .child(commit_box)
+            .into_any_element()
+    }
+
+    /// Vista Ramas (M5): lista con checkout/merge/borrar + crear rama.
+    fn render_branches(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        let mut list = div()
+            .id("branch-list")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll();
+
+        for b in &self.branches {
+            let name = b.name.clone();
+            let (e1, n1) = (e.clone(), name.clone());
+            let (e2, n2) = (e.clone(), name.clone());
+            let (e3, n3) = (e.clone(), name.clone());
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .h(px(30.0))
+                    .hover(|s| s.bg(color::hover()))
+                    .child(div().flex_none().w(px(14.0)).text_color(color::accent()).child(if b.is_head { "●" } else { "" }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_color(if b.is_head { color::accent() } else { color::fg() })
+                            .child(name.clone()),
+                    )
+                    .child(btn(&format!("co-{name}"), "checkout", move |app| { let n = n1.clone(); e1.update(app, |t, cx| t.do_checkout(n, cx)); }))
+                    .child(btn(&format!("mg-{name}"), "merge", move |app| { let n = n2.clone(); e2.update(app, |t, cx| t.do_merge(n, cx)); }))
+                    .child(btn(&format!("rm-{name}"), "borrar", move |app| { let n = n3.clone(); e3.update(app, |t, cx| t.do_delete_branch(n, cx)); })),
+            );
+        }
+
+        let create = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .p_2()
+            .border_t_1()
+            .border_color(color::line())
+            .bg(color::panel())
+            .child(
+                div()
+                    .id("newbranch-input")
+                    .flex_1()
+                    .h(px(28.0))
+                    .px_2()
+                    .py_1()
+                    .bg(color::bg())
+                    .rounded_md()
+                    .border_1()
+                    .border_color(color::line())
+                    .track_focus(&self.branch_focus)
+                    .key_context("newbranch")
+                    .on_key_down(cx.listener(Self::on_branch_key))
+                    .on_click(cx.listener(|this, _, window, _| window.focus(&this.branch_focus)))
+                    .text_xs()
+                    .text_color(if self.new_branch.is_empty() { color::dim() } else { color::fg() })
+                    .child(if self.new_branch.is_empty() {
+                        "nueva rama… (Enter para crear)".to_string()
+                    } else {
+                        self.new_branch.clone()
+                    }),
+            )
+            .child(btn("create-br", "Crear", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.do_create_branch(cx)); } }));
+
+        div().flex().flex_col().flex_1().min_h_0().child(list).child(create).into_any_element()
+    }
+}
+
+/// Botón pequeño de la UI.
+fn btn(id: &str, label: &str, on: impl Fn(&mut App) + 'static) -> impl IntoElement {
+    div()
+        .id(SharedString::from(id.to_string()))
+        .px_2()
+        .py_1()
+        .bg(color::btn())
+        .rounded_md()
+        .text_sm()
+        .cursor_pointer()
+        .hover(|s| s.bg(color::hover()))
+        .on_click(move |_, _, app| on(app))
+        .child(label.to_string())
+}
+
+/// Fila del diff del working tree (sin acción de blame).
+fn wt_row_el(row: &DiffRow) -> gpui::AnyElement {
+    match row {
+        DiffRow::File(_, label) => div()
+            .flex()
+            .items_center()
+            .h(px(DIFF_ROW_H))
+            .w_full()
+            .px_3()
+            .bg(color::panel())
+            .text_color(color::fg())
+            .child(label.replace("   ⟶ blame", ""))
+            .into_any_element(),
+        DiffRow::Hunk(h) => div()
+            .flex()
+            .items_center()
+            .h(px(DIFF_ROW_H))
+            .w_full()
+            .px_3()
+            .text_color(color::dim())
+            .child(h.clone())
+            .into_any_element(),
+        DiffRow::Line(origin, content) => {
+            let (fg, bg, sign) = match origin {
+                LineOrigin::Add => (color::add_fg(), color::add_bg(), "+"),
+                LineOrigin::Del => (color::del_fg(), color::del_bg(), "−"),
+                LineOrigin::Context => (color::fg(), color::bg(), " "),
+            };
+            div()
+                .flex()
+                .items_center()
+                .h(px(DIFF_ROW_H))
+                .w_full()
+                .px_3()
+                .bg(bg)
+                .text_color(fg)
+                .whitespace_nowrap()
+                .child(format!("{sign} {content}"))
+                .into_any_element()
+        }
     }
 }
 
@@ -585,7 +1206,7 @@ fn main() {
                 ..Default::default()
             },
             move |_, cx| {
-                cx.new(move |_| RebasedApp {
+                cx.new(move |cx| RebasedApp {
                     repo_path,
                     commits,
                     graph,
@@ -596,6 +1217,17 @@ fn main() {
                     diff_rows,
                     diff_error: None,
                     blame: None,
+                    view: ViewMode::Log,
+                    op_msg: None,
+                    status: Vec::new(),
+                    status_error: None,
+                    wt_rows: Vec::new(),
+                    wt_file: None,
+                    commit_msg: String::new(),
+                    commit_focus: cx.focus_handle(),
+                    branches: Vec::new(),
+                    new_branch: String::new(),
+                    branch_focus: cx.focus_handle(),
                 })
             },
         )

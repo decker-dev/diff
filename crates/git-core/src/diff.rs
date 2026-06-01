@@ -161,6 +161,48 @@ fn commit_diff_in(repo: &gix::Repository, commit_id: &str) -> Result<Vec<FileDif
     Ok(files)
 }
 
+/// Diff de los cambios del working tree: sin stage (index vs WT) si `staged=false`,
+/// o staged (HEAD vs index) si `staged=true`. Para la vista de Cambios Locales.
+pub fn workdir_diff(path: &str, staged: bool) -> Result<Vec<FileDiff>, String> {
+    let repo = git2::Repository::open(path).map_err(|e| e.to_string())?;
+    let mut opts = git2::DiffOptions::new();
+    opts.context_lines(3).include_untracked(true).recurse_untracked_dirs(true);
+
+    let diff = if staged {
+        let head_tree = repo.head().and_then(|h| h.peel_to_tree()).ok();
+        repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))
+    } else {
+        repo.diff_index_to_workdir(None, Some(&mut opts))
+    }
+    .map_err(|e| e.to_string())?;
+
+    let mut files = Vec::new();
+    for idx in 0..diff.deltas().len() {
+        let delta = match diff.get_delta(idx) {
+            Some(d) => d,
+            None => continue,
+        };
+        let path_s = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (hunks, binary) = match git2::Patch::from_diff(&diff, idx).map_err(|e| e.to_string())? {
+            Some(patch) => patch_to_hunks(patch).map_err(|e| e.to_string())?,
+            None => (Vec::new(), true),
+        };
+        files.push(FileDiff {
+            path: path_s,
+            old_path: None,
+            status: map_delta(delta.status()),
+            binary,
+            hunks,
+        });
+    }
+    Ok(files)
+}
+
 /// Lee los bytes de un blob por su oid (vacío si `None`).
 fn read_blob(repo: &gix::Repository, id: Option<gix::ObjectId>) -> Result<Vec<u8>, String> {
     match id {
@@ -201,4 +243,17 @@ fn patch_to_hunks(patch: git2::Patch) -> Result<(Vec<Hunk>, bool), git2::Error> 
         hunks.push(Hunk { header, lines });
     }
     Ok((hunks, false))
+}
+
+/// Traduce el `Delta` de libgit2 a nuestro `FileState`.
+fn map_delta(d: git2::Delta) -> FileState {
+    use git2::Delta;
+    match d {
+        Delta::Added => FileState::New,
+        Delta::Deleted => FileState::Deleted,
+        Delta::Renamed => FileState::Renamed,
+        Delta::Typechange => FileState::TypeChange,
+        Delta::Conflicted => FileState::Conflicted,
+        _ => FileState::Modified,
+    }
 }
