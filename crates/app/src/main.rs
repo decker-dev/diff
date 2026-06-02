@@ -366,6 +366,9 @@ struct RebasedApp {
     // ---- GitHub (via `gh`) ----
     prs: Vec<PrInfo>,
     prs_msg: Option<String>,
+
+    /// Whether the commit-graph was refreshed for the current repo (once).
+    graph_maintained: bool,
 }
 
 impl RebasedApp {
@@ -421,6 +424,7 @@ impl RebasedApp {
         self.rebase = None;
         self.op_msg = None;
         self.view = ViewMode::Log;
+        self.graph_maintained = false;
 
         // Pre-warm the latest commit's diff and select it.
         if let Some(c) = self.commits.first() {
@@ -1730,6 +1734,17 @@ impl Render for RebasedApp {
                 .bg(color::bg())
                 .text_color(color::fg())
                 .child(self.render_welcome(cx));
+        }
+
+        // Refresh the commit-graph once per repo (background; speeds log/blame).
+        if !self.graph_maintained {
+            self.graph_maintained = true;
+            let path = self.repo_path.clone();
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = git_core::Repo::open(&path).map(|r| r.write_commit_graph());
+                })
+                .detach();
         }
 
         // Focus a freshly-opened modal prompt's input.
@@ -3871,6 +3886,7 @@ fn main() {
                         console_cursor: 0,
                         prs: Vec::new(),
                         prs_msg: None,
+                        graph_maintained: false,
                     };
                     if let Some(p) = initial {
                         app.load_repo(&p);

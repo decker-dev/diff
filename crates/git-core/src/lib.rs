@@ -464,6 +464,12 @@ impl Repo {
         self.git_cli(args)
     }
 
+    /// Writes/refreshes the commit-graph (accelerates log + blame). Cheap to
+    /// re-run; best done in the background after opening a repo.
+    pub fn write_commit_graph(&self) -> Result<String, String> {
+        self.git_cli(&["commit-graph", "write", "--reachable"])
+    }
+
     /// fetch from the given remote.
     pub fn fetch(&self, remote: &str) -> Result<String, String> {
         self.git_cli(&["fetch", remote])
