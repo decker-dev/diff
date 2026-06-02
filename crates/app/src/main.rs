@@ -9,8 +9,8 @@ use git_core::graph::{compute_graph, EdgeKind, RowGraph};
 use git_core::syntax::{self, Lang};
 use git_core::rebase::{RebaseAction, RebaseResult, RebaseStep};
 use git_core::{
-    AheadBehind, BranchInfo, CommitInfo, ConflictSides, RefKind, RefLabel, ReflogEntry, RemoteInfo,
-    StashInfo, StatusEntry, SubmoduleInfo, TagInfo,
+    AheadBehind, BranchInfo, CommitInfo, ConflictSides, PrComment, PrDetail, RefKind, RefLabel,
+    ReflogEntry, RemoteInfo, StashInfo, StatusEntry, SubmoduleInfo, TagInfo,
 };
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds,
@@ -143,6 +143,64 @@ struct PrInfo {
     branch: String,
     state: String,
     author: String,
+}
+
+/// The open PR detail/review session (diff + threaded comments).
+struct PrView {
+    detail: PrDetail,
+    /// Flattened diff with conversation + inline comment threads interleaved.
+    rows: Vec<PrRow>,
+    loading: bool,
+    error: Option<String>,
+}
+
+/// What the inline composer will post on submit.
+#[derive(Clone)]
+enum ComposeTarget {
+    /// A new inline review comment at `path`:`line` on `side` (RIGHT/LEFT).
+    Line { path: String, line: u32, side: String },
+    /// A reply to an existing review-comment thread.
+    Reply { comment_id: String, label: String },
+    /// A general conversation comment on the PR.
+    General,
+    /// A review submission: kind ∈ {approve, request-changes, comment}.
+    Review { kind: String },
+}
+
+impl ComposeTarget {
+    /// Header label for the composer panel.
+    fn label(&self) -> String {
+        match self {
+            ComposeTarget::Line { path, line, side } => format!("Comment on {path}:{line} ({side})"),
+            ComposeTarget::Reply { label, .. } => format!("Reply to {label}"),
+            ComposeTarget::General => "Comment on the conversation".into(),
+            ComposeTarget::Review { kind } => match kind.as_str() {
+                "approve" => "Approve — optional message".into(),
+                "request-changes" => "Request changes — describe what's needed".into(),
+                _ => "Review comment".into(),
+            },
+        }
+    }
+}
+
+/// A row in the PR review view (conversation, diff structure, inline comments).
+enum PrRow {
+    /// A conversation/issue comment (or an orphaned inline comment).
+    Conversation(PrComment),
+    /// File header ("path  +a −d" label).
+    File(String),
+    Hunk(String),
+    /// A diff line, carrying its anchor (path/line/side) for "add comment".
+    Line {
+        origin: LineOrigin,
+        content: String,
+        lang: Lang,
+        path: String,
+        line: u32,
+        side: String,
+    },
+    /// An inline review comment attached under its line.
+    Comment(PrComment),
 }
 
 /// A small colored chip for a ref (branch/tag/HEAD) on a commit row.
@@ -337,6 +395,58 @@ fn build_side_rows(diff: &[FileDiff]) -> Vec<SideRow> {
     rows
 }
 
+/// Flattens a PR's diff + comments into review rows: conversation comments
+/// first, then each file's diff with inline comment threads interleaved under
+/// the lines they target. Inline comments that don't map to a visible line
+/// (e.g. outdated) are appended as conversation-style cards.
+fn build_pr_rows(diff: &[FileDiff], comments: &[PrComment], conversation: &[PrComment]) -> Vec<PrRow> {
+    let mut rows = Vec::new();
+    for c in conversation {
+        rows.push(PrRow::Conversation(c.clone()));
+    }
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for f in diff {
+        let lang = syntax::lang_for_path(&f.path);
+        let (add, del) = f.line_stats();
+        rows.push(PrRow::File(format!("{}   +{add} −{del}", f.path)));
+        for h in &f.hunks {
+            rows.push(PrRow::Hunk(h.header.clone()));
+            for l in &h.lines {
+                let (side, line) = match l.new_lineno {
+                    Some(n) => ("RIGHT", n),
+                    None => ("LEFT", l.old_lineno.unwrap_or(0)),
+                };
+                rows.push(PrRow::Line {
+                    origin: l.origin,
+                    content: l.content.clone(),
+                    lang,
+                    path: f.path.clone(),
+                    line,
+                    side: side.to_string(),
+                });
+                for c in comments {
+                    if c.path != f.path || used.contains(&c.id) {
+                        continue;
+                    }
+                    let on_right = (c.side == "RIGHT" || c.side.is_empty()) && l.new_lineno == Some(c.line);
+                    let on_left = c.side == "LEFT" && l.old_lineno == Some(c.line);
+                    if on_right || on_left {
+                        rows.push(PrRow::Comment(c.clone()));
+                        used.insert(c.id.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Orphaned inline comments (anchored outside the current diff window).
+    for c in comments {
+        if !used.contains(&c.id) {
+            rows.push(PrRow::Conversation(c.clone()));
+        }
+    }
+    rows
+}
+
 struct RebasedApp {
     repo_path: String,
     commits: Vec<CommitInfo>,
@@ -445,6 +555,15 @@ struct RebasedApp {
     // ---- GitHub (via `gh`) ----
     prs: Vec<PrInfo>,
     prs_msg: Option<String>,
+    /// Open PR review session (None = show the PR list).
+    pr_view: Option<PrView>,
+    /// Inline comment composer: target + buffer + caret.
+    pr_compose_target: Option<ComposeTarget>,
+    pr_compose: String,
+    pr_compose_focus: FocusHandle,
+    pr_compose_cursor: usize,
+    /// Set when opening the composer, to focus its input on next render.
+    focus_pr_compose: bool,
 
     // ---- File history / pickaxe search ----
     /// Ad-hoc commit list (file history or search) feeding the shared diff panel.
@@ -517,6 +636,10 @@ impl RebasedApp {
         self.aux = None;
         self.search_term.clear();
         self.search_cursor = 0;
+        self.pr_view = None;
+        self.pr_compose_target = None;
+        self.pr_compose.clear();
+        self.pr_compose_cursor = 0;
         self.graph_maintained = false;
 
         // Pre-warm the latest commit's diff and select it.
@@ -1305,6 +1428,149 @@ impl RebasedApp {
         .detach();
     }
 
+    /// Opens the PR review session: loads detail + diff + comments (background).
+    fn open_pr(&mut self, number: String, cx: &mut Context<Self>) {
+        self.view = ViewMode::PullRequests;
+        self.more_open = false;
+        self.op_msg = None;
+        self.pr_compose_target = None;
+        self.pr_compose.clear();
+        self.pr_view = Some(PrView {
+            detail: PrDetail { number: number.clone(), ..Default::default() },
+            rows: Vec::new(),
+            loading: true,
+            error: None,
+        });
+        cx.notify();
+
+        let repo = self.repo_path.clone();
+        cx.spawn(async move |this, cx| {
+            let num = number.clone();
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    let detail = git_core::gh_pr_detail(&repo, &num)?;
+                    let diff_text = git_core::gh_pr_diff(&repo, &num).unwrap_or_default();
+                    let diff = git_core::diff::parse_unified_diff(&diff_text);
+                    let comments = git_core::gh_pr_review_comments(&repo, &num).unwrap_or_default();
+                    let conversation = git_core::gh_pr_conversation(&repo, &num).unwrap_or_default();
+                    Ok::<_, String>((detail, diff, comments, conversation))
+                })
+                .await;
+            let _ = this.update(cx, |t, cx| {
+                let still = matches!(&t.pr_view, Some(v) if v.detail.number == number);
+                if !still {
+                    return;
+                }
+                match res {
+                    Ok((detail, diff, comments, conversation)) => {
+                        let rows = build_pr_rows(&diff, &comments, &conversation);
+                        t.pr_view = Some(PrView { detail, rows, loading: false, error: None });
+                    }
+                    Err(e) => {
+                        if let Some(v) = t.pr_view.as_mut() {
+                            v.loading = false;
+                            v.error = Some(e);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Closes the PR review session, back to the PR list.
+    fn close_pr(&mut self, cx: &mut Context<Self>) {
+        self.pr_view = None;
+        self.pr_compose_target = None;
+        self.pr_compose.clear();
+        cx.notify();
+    }
+
+    /// Reloads the currently open PR (after posting a comment/review).
+    fn reload_pr(&mut self, cx: &mut Context<Self>) {
+        if let Some(v) = &self.pr_view {
+            let n = v.detail.number.clone();
+            self.open_pr(n, cx);
+        }
+    }
+
+    /// Opens the inline composer targeting `target`.
+    fn pr_compose_to(&mut self, target: ComposeTarget, cx: &mut Context<Self>) {
+        self.pr_compose_target = Some(target);
+        self.pr_compose.clear();
+        self.pr_compose_cursor = 0;
+        self.focus_pr_compose = true;
+        cx.notify();
+    }
+
+    fn pr_cancel_compose(&mut self, cx: &mut Context<Self>) {
+        self.pr_compose_target = None;
+        self.pr_compose.clear();
+        self.pr_compose_cursor = 0;
+        cx.notify();
+    }
+
+    /// Submits the composer (post inline comment / reply / conversation / review).
+    fn pr_submit(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.pr_compose_target.clone() else { return };
+        let Some(v) = &self.pr_view else { return };
+        let number = v.detail.number.clone();
+        let head_sha = v.detail.head_sha.clone();
+        let body = self.pr_compose.clone();
+        // Only an "approve" review may have an empty body.
+        let optional_body = matches!(&target, ComposeTarget::Review { kind } if kind == "approve");
+        if !optional_body && body.trim().is_empty() {
+            self.op_msg = Some("✗ write something first".into());
+            cx.notify();
+            return;
+        }
+        let repo = self.repo_path.clone();
+        self.op_msg = Some("Posting…".into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    match target {
+                        ComposeTarget::Line { path, line, side } => {
+                            git_core::gh_pr_add_comment(&repo, &number, &head_sha, &path, line, &side, &body)
+                        }
+                        ComposeTarget::Reply { comment_id, .. } => {
+                            git_core::gh_pr_reply(&repo, &number, &comment_id, &body)
+                        }
+                        ComposeTarget::General => git_core::gh_pr_comment_general(&repo, &number, &body),
+                        ComposeTarget::Review { kind } => git_core::gh_pr_review(&repo, &number, &kind, &body),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |t, cx| {
+                match res {
+                    Ok(m) => {
+                        t.op_msg = Some(format!("✓ {m}"));
+                        t.pr_compose_target = None;
+                        t.pr_compose.clear();
+                        t.reload_pr(cx);
+                    }
+                    Err(e) => t.op_msg = Some(format!("✗ {}", first_line(&e))),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn on_pr_compose_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        // ⌘↵ submits; plain Enter inserts a newline (comments are multi-line).
+        if ev.keystroke.key == "enter" && ev.keystroke.modifiers.platform {
+            self.pr_submit(cx);
+            return;
+        }
+        edit_key(&mut self.pr_compose, &mut self.pr_compose_cursor, ev, true);
+        cx.notify();
+    }
+
     fn do_clone(&mut self, spec: String, cx: &mut Context<Self>) {
         let mut it = spec.split_whitespace();
         let Some(url) = it.next().map(str::to_string) else { return };
@@ -2035,6 +2301,11 @@ impl Render for RebasedApp {
                 window.focus(&p.focus);
             }
             self.focus_prompt = false;
+        }
+        // Focus a freshly-opened PR comment composer.
+        if self.focus_pr_compose {
+            window.focus(&self.pr_compose_focus);
+            self.focus_pr_compose = false;
         }
 
         let toolbar = self.render_toolbar(cx);
@@ -3344,6 +3615,10 @@ impl RebasedApp {
 
     /// GitHub pull requests (via the `gh` CLI).
     fn render_prs(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // An open review session takes over the whole view.
+        if self.pr_view.is_some() {
+            return self.render_pr_detail(cx);
+        }
         let e = cx.entity();
         let mut list = div().id("prs-list").flex().flex_col().flex_1().min_h_0().overflow_y_scroll();
         if let Some(m) = &self.prs_msg {
@@ -3351,6 +3626,7 @@ impl RebasedApp {
         }
         for p in &self.prs {
             let num = p.number.clone();
+            let (e0, n0) = (e.clone(), num.clone());
             let (e1, n1) = (e.clone(), num.clone());
             let (e2, n2) = (e.clone(), num.clone());
             let state_col = if p.state == "OPEN" { color::ok() } else { color::dim() };
@@ -3369,6 +3645,7 @@ impl RebasedApp {
                     .child(div().flex_none().w(px(150.0)).whitespace_nowrap().text_ellipsis().text_xs().text_color(color::dim()).child(p.branch.clone()))
                     .child(div().flex_none().w(px(90.0)).whitespace_nowrap().text_ellipsis().text_xs().text_color(color::dim()).child(p.author.clone()))
                     .child(div().flex_none().w(px(56.0)).text_xs().text_color(state_col).child(p.state.clone()))
+                    .child(btn(&format!("pr-rev-{num}"), "review", move |app| { let n = n0.clone(); e0.update(app, |t, cx| t.open_pr(n, cx)); }))
                     .child(btn(&format!("pr-co-{num}"), "checkout", move |app| { let n = n1.clone(); e1.update(app, |t, cx| t.pr_action(n, false, cx)); }))
                     .child(btn(&format!("pr-web-{num}"), "web", move |app| { let n = n2.clone(); e2.update(app, |t, cx| t.pr_action(n, true, cx)); })),
             );
@@ -3386,6 +3663,163 @@ impl RebasedApp {
             .child(div().flex_1())
             .child(div().text_xs().text_color(color::dim()).child("via gh CLI"));
         titled("Pull requests", div().flex().flex_col().flex_1().min_h_0().child(list).child(footer).into_any_element())
+    }
+
+    /// PR review view: header + actions + (conversation + diff + inline threads)
+    /// + the inline composer panel when active.
+    fn render_pr_detail(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        let v = self.pr_view.as_ref().unwrap();
+        let d = &v.detail;
+
+        let state_col = if d.state == "OPEN" { color::ok() } else { color::dim() };
+        let header = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .bg(color::panel())
+            .border_b_1()
+            .border_color(color::line())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(btn("pr-back", "← PRs", { let e = e.clone(); move |app| e.update(app, |t, cx| t.close_pr(cx)) }))
+                    .child(div().flex_none().font_family("Menlo").text_color(color::accent()).child(format!("#{}", d.number)))
+                    .child(div().flex_1().min_w_0().whitespace_nowrap().text_ellipsis().text_color(color::fg()).child(d.title.clone()))
+                    .child(div().flex_none().text_xs().text_color(state_col).child(d.state.clone())),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .text_xs()
+                    .text_color(color::dim())
+                    .child(format!("@{}", d.author))
+                    .child(format!("{} ← {}", d.base, d.head))
+                    .child(div().text_color(color::add_fg()).child(format!("+{}", d.additions)))
+                    .child(div().text_color(color::del_fg()).child(format!("−{}", d.deletions))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(btn("pr-d-refresh", "Refresh", { let e = e.clone(); move |app| e.update(app, |t, cx| t.reload_pr(cx)) }))
+                    .child(btn("pr-d-approve", "✓ Approve", { let e = e.clone(); move |app| e.update(app, |t, cx| t.pr_compose_to(ComposeTarget::Review { kind: "approve".into() }, cx)) }))
+                    .child(btn("pr-d-request", "✗ Request changes", { let e = e.clone(); move |app| e.update(app, |t, cx| t.pr_compose_to(ComposeTarget::Review { kind: "request-changes".into() }, cx)) }))
+                    .child(btn("pr-d-comment", "💬 Comment", { let e = e.clone(); move |app| e.update(app, |t, cx| t.pr_compose_to(ComposeTarget::General, cx)) }))
+                    .child(btn("pr-d-co", "Checkout", { let e = e.clone(); let n = d.number.clone(); move |app| { let n = n.clone(); e.update(app, |t, cx| t.pr_action(n, false, cx)); } }))
+                    .child(btn("pr-d-web", "Web", { let e = e.clone(); let n = d.number.clone(); move |app| { let n = n.clone(); e.update(app, |t, cx| t.pr_action(n, true, cx)); } })),
+            );
+
+        let body: gpui::AnyElement = if v.loading {
+            div().flex_1().p_3().text_color(color::dim()).child("Loading pull request…").into_any_element()
+        } else if let Some(err) = &v.error {
+            div().flex_1().p_3().text_color(color::err()).child(format!("gh: {err}")).into_any_element()
+        } else {
+            let entity = e.clone();
+            let syntax_on = self.diff_syntax;
+            let desc = (!d.body.trim().is_empty()).then(|| {
+                let mut col = div().flex().flex_col().w_full().px_3().py_2().bg(color::bg()).border_b_1().border_color(color::line()).text_sm().text_color(color::fg());
+                for line in d.body.lines().take(40) {
+                    col = col.child(div().child(line.to_string()));
+                }
+                col
+            });
+            // Comment cards have variable height, so this list is a plain
+            // scroll column (not uniform_list). PR diffs are bounded; we cap
+            // rendered rows for safety and note any truncation.
+            const CAP: usize = 4000;
+            let mut list = div()
+                .id("pr-rows")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .font_family("Menlo")
+                .text_xs();
+            for r in v.rows.iter().take(CAP) {
+                list = list.child(pr_row_el(r, &entity, syntax_on));
+            }
+            if v.rows.len() > CAP {
+                list = list.child(
+                    div().p_2().text_color(color::dim()).child(format!("… {} more rows (truncated)", v.rows.len() - CAP)),
+                );
+            }
+            div().flex().flex_col().flex_1().min_h_0().children(desc).child(list).into_any_element()
+        };
+
+        let composer = self.pr_compose_target.as_ref().map(|target| {
+            let label = target.label();
+            let submit_label = match target {
+                ComposeTarget::Review { kind } if kind == "approve" => "Approve",
+                ComposeTarget::Review { kind } if kind == "request-changes" => "Request changes",
+                ComposeTarget::Review { .. } => "Submit review",
+                ComposeTarget::Reply { .. } => "Reply",
+                _ => "Comment",
+            };
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .gap_1()
+                .p_2()
+                .border_t_1()
+                .border_color(color::line())
+                .bg(color::panel())
+                .child(div().text_xs().text_color(color::accent()).child(label))
+                .child(
+                    div()
+                        .id("pr-compose")
+                        .w_full()
+                        .h(px(60.0))
+                        .p_2()
+                        .bg(color::bg())
+                        .rounded_md()
+                        .border_1()
+                        .border_color(color::line())
+                        .track_focus(&self.pr_compose_focus)
+                        .key_context("prcompose")
+                        .on_key_down(cx.listener(Self::on_pr_compose_key))
+                        .on_click(cx.listener(|t, _, w, _| w.focus(&t.pr_compose_focus)))
+                        .font_family("Menlo")
+                        .text_xs()
+                        .text_color(if self.pr_compose.is_empty() { color::dim() } else { color::fg() })
+                        .child(if self.pr_compose.is_empty() {
+                            "Write a comment…  (⌘↵ to submit)".to_string()
+                        } else {
+                            with_caret(&self.pr_compose, self.pr_compose_cursor)
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(btn("pr-submit", submit_label, { let e = e.clone(); move |app| e.update(app, |t, cx| t.pr_submit(cx)) }))
+                        .child(btn("pr-cancel", "Cancel", { let e = e.clone(); move |app| e.update(app, |t, cx| t.pr_cancel_compose(cx)) })),
+                )
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(header)
+            .child(body)
+            .children(composer)
+            .into_any_element()
     }
 
     /// File-history view (commits touching one file) over the shared diff panel.
@@ -4122,6 +4556,119 @@ fn file_action_chip(
         .child(label)
 }
 
+/// Renders one PR review row: a conversation card, a file/hunk header, a diff
+/// line (with an "add comment" affordance), or an inline comment card.
+fn pr_row_el(row: &PrRow, entity: &Entity<RebasedApp>, syntax_on: bool) -> gpui::AnyElement {
+    match row {
+        PrRow::Conversation(c) => pr_comment_card(c, entity, false),
+        PrRow::Comment(c) => pr_comment_card(c, entity, true),
+        PrRow::File(label) => div()
+            .flex()
+            .items_center()
+            .h(px(DIFF_ROW_H))
+            .w_full()
+            .px_3()
+            .bg(color::panel())
+            .text_color(color::fg())
+            .child(label.clone())
+            .into_any_element(),
+        PrRow::Hunk(h) => div()
+            .flex()
+            .items_center()
+            .h(px(DIFF_ROW_H))
+            .w_full()
+            .px_3()
+            .text_color(color::dim())
+            .child(h.clone())
+            .into_any_element(),
+        PrRow::Line { origin, content, lang, path, line, side } => {
+            let (fg, bg, sign) = match origin {
+                LineOrigin::Add => (color::add_fg(), color::add_bg(), "+"),
+                LineOrigin::Del => (color::del_fg(), color::del_bg(), "−"),
+                LineOrigin::Context => (color::fg(), color::bg(), " "),
+            };
+            let (p, s, ln) = (path.clone(), side.clone(), *line);
+            let e = entity.clone();
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .h(px(DIFF_ROW_H))
+                .w_full()
+                .px_2()
+                .bg(bg)
+                .child(
+                    div()
+                        .id(SharedString::from(format!("prc:{path}:{side}:{line}")))
+                        .flex_none()
+                        .w(px(16.0))
+                        .text_color(color::dim())
+                        .cursor_pointer()
+                        .hover(|x| x.text_color(color::accent()))
+                        .on_click(move |_, _, app| {
+                            let (p, s) = (p.clone(), s.clone());
+                            e.update(app, |t, cx| {
+                                t.pr_compose_to(ComposeTarget::Line { path: p, line: ln, side: s }, cx)
+                            });
+                        })
+                        .child("✚"),
+                )
+                .child(div().flex_none().w(px(12.0)).text_color(fg).child(sign))
+                .child(line_spans(content, *lang, syntax_on, fg))
+                .into_any_element()
+        }
+    }
+}
+
+/// A comment card (conversation or inline). Inline cards are indented/tinted.
+fn pr_comment_card(c: &PrComment, entity: &Entity<RebasedApp>, inline: bool) -> gpui::AnyElement {
+    let anchor = if c.path.is_empty() {
+        String::new()
+    } else {
+        format!("  ·  {}:{}", c.path, c.line)
+    };
+    let when = c.created_at.split('T').next().unwrap_or("").to_string();
+    let (id, author) = (c.id.clone(), c.author.clone());
+    let e = entity.clone();
+
+    let mut body_col = div().flex().flex_col().w_full().text_color(color::fg());
+    if c.body.trim().is_empty() {
+        body_col = body_col.child(div().text_color(color::dim()).child("(no text)"));
+    } else {
+        for line in c.body.lines() {
+            body_col = body_col.child(div().w_full().child(line.to_string()));
+        }
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .gap_1()
+        .px_3()
+        .py_2()
+        .when(inline, |d| d.pl(px(28.0)).bg(color::panel()))
+        .border_b_1()
+        .border_color(color::row_line())
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(div().flex_none().text_xs().text_color(color::accent()).child(format!("@{author}")))
+                .child(div().flex_1().min_w_0().text_xs().text_color(color::dim()).whitespace_nowrap().text_ellipsis().child(format!("{when}{anchor}")))
+                .child(btn(&format!("pr-reply-{id}"), "reply", move |app| {
+                    let (id, author) = (id.clone(), author.clone());
+                    e.update(app, |t, cx| {
+                        t.pr_compose_to(ComposeTarget::Reply { comment_id: id, label: format!("@{author}") }, cx)
+                    });
+                })),
+        )
+        .child(body_col)
+        .into_any_element()
+}
+
 /// A side-by-side diff row: file header, hunk header, or a left/right pair.
 fn side_row_el(row: &SideRow, syntax_on: bool) -> gpui::AnyElement {
     match row {
@@ -4491,6 +5038,12 @@ fn main() {
                         console_cursor: 0,
                         prs: Vec::new(),
                         prs_msg: None,
+                        pr_view: None,
+                        pr_compose_target: None,
+                        pr_compose: String::new(),
+                        pr_compose_focus: cx.focus_handle(),
+                        pr_compose_cursor: 0,
+                        focus_pr_compose: false,
                         aux: None,
                         search_term: String::new(),
                         search_focus: cx.focus_handle(),

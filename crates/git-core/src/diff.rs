@@ -291,6 +291,106 @@ pub fn build_hunk_patch(file: &FileDiff, hunk_index: usize) -> Option<String> {
     Some(p)
 }
 
+/// Parses a textual unified diff (as produced by `git diff` / `gh pr diff`)
+/// into our structured [`FileDiff`] list, computing per-line old/new line
+/// numbers. Used to render a PR's diff with comments anchored to lines.
+pub fn parse_unified_diff(patch: &str) -> Vec<FileDiff> {
+    let mut files: Vec<FileDiff> = Vec::new();
+    let mut cur: Option<FileDiff> = None;
+    let (mut old_no, mut new_no) = (0u32, 0u32);
+
+    for raw in patch.lines() {
+        if let Some(rest) = raw.strip_prefix("diff --git ") {
+            if let Some(f) = cur.take() {
+                files.push(f);
+            }
+            cur = Some(FileDiff {
+                path: diff_git_new_path(rest),
+                old_path: None,
+                status: FileState::Modified,
+                binary: false,
+                hunks: Vec::new(),
+            });
+            continue;
+        }
+        let Some(f) = cur.as_mut() else { continue };
+
+        if raw.starts_with("new file mode") {
+            f.status = FileState::New;
+        } else if raw.starts_with("deleted file mode") {
+            f.status = FileState::Deleted;
+        } else if let Some(p) = raw.strip_prefix("rename from ") {
+            f.old_path = Some(p.to_string());
+            f.status = FileState::Renamed;
+        } else if raw.starts_with("rename to ") {
+            f.status = FileState::Renamed;
+        } else if raw.starts_with("Binary files") || raw.starts_with("GIT binary patch") {
+            f.binary = true;
+        } else if let Some(p) = raw.strip_prefix("+++ ") {
+            let pp = p.trim();
+            if pp != "/dev/null" {
+                f.path = pp.strip_prefix("b/").unwrap_or(pp).to_string();
+            }
+        } else if raw.starts_with("--- ") {
+            // old-path marker; the path comes from `diff --git`/`+++`.
+        } else if raw.starts_with("@@") {
+            if let Some((o, n)) = parse_hunk_header(raw) {
+                old_no = o;
+                new_no = n;
+            }
+            f.hunks.push(Hunk { header: raw.to_string(), lines: Vec::new() });
+        } else if let Some(hunk) = f.hunks.last_mut() {
+            let (origin, content) = match raw.as_bytes().first() {
+                Some(b'+') => (LineOrigin::Add, &raw[1..]),
+                Some(b'-') => (LineOrigin::Del, &raw[1..]),
+                Some(b' ') => (LineOrigin::Context, &raw[1..]),
+                // "\ No newline at end of file" and any stray lines: skip.
+                _ => continue,
+            };
+            let (old_lineno, new_lineno) = match origin {
+                LineOrigin::Add => {
+                    let n = new_no;
+                    new_no += 1;
+                    (None, Some(n))
+                }
+                LineOrigin::Del => {
+                    let o = old_no;
+                    old_no += 1;
+                    (Some(o), None)
+                }
+                LineOrigin::Context => {
+                    let (o, n) = (old_no, new_no);
+                    old_no += 1;
+                    new_no += 1;
+                    (Some(o), Some(n))
+                }
+            };
+            hunk.lines.push(DiffLine { origin, old_lineno, new_lineno, content: content.to_string() });
+        }
+    }
+    if let Some(f) = cur.take() {
+        files.push(f);
+    }
+    files
+}
+
+/// From a `diff --git a/<old> b/<new>` tail, returns `<new>`.
+fn diff_git_new_path(rest: &str) -> String {
+    if let Some(idx) = rest.find(" b/") {
+        return rest[idx + 3..].trim().to_string();
+    }
+    rest.trim().trim_start_matches("a/").to_string()
+}
+
+/// Parses the start line numbers from a `@@ -a,b +c,d @@` header → (a, c).
+fn parse_hunk_header(h: &str) -> Option<(u32, u32)> {
+    let minus = h.find('-')?;
+    let plus = h.find('+')?;
+    let old = h[minus + 1..].split([',', ' ']).next()?.parse().ok()?;
+    let new = h[plus + 1..].split([',', ' ']).next()?.parse().ok()?;
+    Some((old, new))
+}
+
 /// Translates libgit2's `Delta` to our `FileState`.
 fn map_delta(d: git2::Delta) -> FileState {
     use git2::Delta;
@@ -301,5 +401,50 @@ fn map_delta(d: git2::Delta) -> FileState {
         Delta::Typechange => FileState::TypeChange,
         Delta::Conflicted => FileState::Conflicted,
         _ => FileState::Modified,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_unified_diff_with_line_numbers() {
+        let patch = "\
+diff --git a/src/x.rs b/src/x.rs
+index 111..222 100644
+--- a/src/x.rs
++++ b/src/x.rs
+@@ -1,4 +1,5 @@
+ ctx1
+-old line
++new line
++added line
+ ctx2
+diff --git a/new.txt b/new.txt
+new file mode 100644
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,2 @@
++hello
++world
+";
+        let files = parse_unified_diff(patch);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "src/x.rs");
+        assert_eq!(files[0].status, FileState::Modified);
+        let h = &files[0].hunks[0];
+        // The deletion is old line 2; the first addition is new line 2.
+        let del = h.lines.iter().find(|l| l.origin == LineOrigin::Del).unwrap();
+        assert_eq!(del.old_lineno, Some(2));
+        let add = h.lines.iter().find(|l| l.origin == LineOrigin::Add).unwrap();
+        assert_eq!(add.new_lineno, Some(2));
+        // Context "ctx2" is old line 3 / new line 4.
+        let ctx2 = h.lines.iter().find(|l| l.content == "ctx2").unwrap();
+        assert_eq!((ctx2.old_lineno, ctx2.new_lineno), (Some(3), Some(4)));
+
+        assert_eq!(files[1].path, "new.txt");
+        assert_eq!(files[1].status, FileState::New);
+        assert_eq!(files[1].hunks[0].lines[0].new_lineno, Some(1));
     }
 }

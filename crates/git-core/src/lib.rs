@@ -993,22 +993,45 @@ pub fn clone_repo(url: &str, dir: &str) -> Result<String, String> {
     }
 }
 
-/// Lists pull requests via the `gh` CLI (tab-separated: number, title, branch,
-/// state). Returns an error string if `gh` is missing or not authenticated.
-pub fn gh_pr_list(repo_dir: &str) -> Result<String, String> {
+/// Full detail of a pull request (from `gh pr view`).
+#[derive(Debug, Clone, Default)]
+pub struct PrDetail {
+    pub number: String,
+    pub title: String,
+    pub state: String,
+    pub author: String,
+    /// Base branch (merge target).
+    pub base: String,
+    /// Head branch (the PR's source).
+    pub head: String,
+    /// Head commit oid — required to post line comments.
+    pub head_sha: String,
+    pub additions: u32,
+    pub deletions: u32,
+    pub url: String,
+    pub body: String,
+}
+
+/// A comment on a PR — either an inline review comment (anchored to
+/// `path`/`line`/`side`) or a conversation comment (those fields empty/0).
+#[derive(Debug, Clone)]
+pub struct PrComment {
+    pub id: String,
+    pub author: String,
+    pub body: String,
+    pub path: String,
+    pub line: u32,
+    /// "RIGHT" (new side) or "LEFT" (old side); empty for conversation comments.
+    pub side: String,
+    pub created_at: String,
+}
+
+/// Runs `gh <args>` with the working directory set to `repo_dir` so `gh`
+/// auto-detects the repo from its remote (gh has no global `-C` flag).
+fn run_gh(repo_dir: &str, args: &[&str]) -> Result<String, String> {
     let out = std::process::Command::new("gh")
-        .arg("-C")
-        .arg(repo_dir)
-        .args([
-            "pr",
-            "list",
-            "--limit",
-            "50",
-            "--json",
-            "number,title,headRefName,state,author",
-            "--template",
-            "{{range .}}{{.number}}\t{{.title}}\t{{.headRefName}}\t{{.state}}\t{{.author.login}}\n{{end}}",
-        ])
+        .current_dir(repo_dir)
+        .args(args)
         .output()
         .map_err(|e| format!("gh not found: {e}"))?;
     if out.status.success() {
@@ -1018,19 +1041,166 @@ pub fn gh_pr_list(repo_dir: &str) -> Result<String, String> {
     }
 }
 
+/// Lists pull requests via the `gh` CLI (tab-separated: number, title, branch,
+/// state, author). Returns an error string if `gh` is missing or not authed.
+pub fn gh_pr_list(repo_dir: &str) -> Result<String, String> {
+    run_gh(
+        repo_dir,
+        &[
+            "pr",
+            "list",
+            "--limit",
+            "50",
+            "--json",
+            "number,title,headRefName,state,author",
+            "--template",
+            "{{range .}}{{.number}}\t{{.title}}\t{{.headRefName}}\t{{.state}}\t{{.author.login}}\n{{end}}",
+        ],
+    )
+}
+
 /// Runs a `gh pr <args>` subcommand in `repo_dir` (checkout, view --web, …).
 pub fn gh_pr(repo_dir: &str, args: &[&str]) -> Result<String, String> {
-    let mut a = vec!["-C", repo_dir, "pr"];
+    let mut a = vec!["pr"];
     a.extend_from_slice(args);
-    let out = std::process::Command::new("gh")
-        .args(&a)
-        .output()
-        .map_err(|e| format!("gh not found: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    run_gh(repo_dir, &a)
+}
+
+/// jq program that flattens a comment object to our unit-separated TSV record.
+/// Newlines in the body are encoded as `` (decoded back in Rust) so each
+/// comment stays on one output line.
+const PR_COMMENT_JQ: &str = r#".[] | [(.id|tostring),(.user.login // ""),(.path // ""),(((.line // .original_line) // 0)|tostring),(.side // ""),(.created_at // ""),(.body|gsub("\t";"  ")|gsub("\r";"")|gsub("\n";""))] | @tsv"#;
+
+fn parse_pr_comments(out: &str) -> Vec<PrComment> {
+    out.lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let id = f.next()?.to_string();
+            let author = f.next().unwrap_or("").to_string();
+            let path = f.next().unwrap_or("").to_string();
+            let line = f.next().unwrap_or("0").trim().parse().unwrap_or(0);
+            let side = f.next().unwrap_or("").to_string();
+            let created_at = f.next().unwrap_or("").to_string();
+            let body = f.next().unwrap_or("").replace('\u{1}', "\n");
+            Some(PrComment { id, author, body, path, line, side, created_at })
+        })
+        .collect()
+}
+
+/// Full PR detail (scalars + body). Two calls: scalars as TSV, body raw.
+pub fn gh_pr_detail(repo_dir: &str, number: &str) -> Result<PrDetail, String> {
+    let tsv = run_gh(
+        repo_dir,
+        &[
+            "pr", "view", number,
+            "--json", "number,title,state,author,baseRefName,headRefName,headRefOid,additions,deletions,url",
+            "--jq", r#"[(.number|tostring),.title,.state,(.author.login // ""),.baseRefName,.headRefName,.headRefOid,(.additions|tostring),(.deletions|tostring),.url]|@tsv"#,
+        ],
+    )?;
+    let line = tsv.lines().next().unwrap_or("");
+    let mut f = line.split('\t');
+    let mut next = || f.next().unwrap_or("").to_string();
+    let mut d = PrDetail {
+        number: next(),
+        title: next(),
+        state: next(),
+        author: next(),
+        base: next(),
+        head: next(),
+        head_sha: next(),
+        additions: next().parse().unwrap_or(0),
+        deletions: next().parse().unwrap_or(0),
+        url: next(),
+        body: String::new(),
+    };
+    d.body = run_gh(repo_dir, &["pr", "view", number, "--json", "body", "--jq", ".body"])
+        .unwrap_or_default()
+        .trim_end()
+        .to_string();
+    Ok(d)
+}
+
+/// The PR's unified diff (`gh pr diff`).
+pub fn gh_pr_diff(repo_dir: &str, number: &str) -> Result<String, String> {
+    run_gh(repo_dir, &["pr", "diff", number])
+}
+
+/// Inline review comments (anchored to file lines).
+pub fn gh_pr_review_comments(repo_dir: &str, number: &str) -> Result<Vec<PrComment>, String> {
+    let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments");
+    let out = run_gh(repo_dir, &["api", "--paginate", &endpoint, "--jq", PR_COMMENT_JQ])?;
+    Ok(parse_pr_comments(&out))
+}
+
+/// Conversation (issue) comments on the PR.
+pub fn gh_pr_conversation(repo_dir: &str, number: &str) -> Result<Vec<PrComment>, String> {
+    let endpoint = format!("repos/{{owner}}/{{repo}}/issues/{number}/comments");
+    let out = run_gh(repo_dir, &["api", "--paginate", &endpoint, "--jq", PR_COMMENT_JQ])?;
+    Ok(parse_pr_comments(&out))
+}
+
+/// Posts a single inline review comment on `path` at `line` (`side` =
+/// RIGHT/LEFT) against the PR's head commit.
+pub fn gh_pr_add_comment(
+    repo_dir: &str,
+    number: &str,
+    head_sha: &str,
+    path: &str,
+    line: u32,
+    side: &str,
+    body: &str,
+) -> Result<String, String> {
+    let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments");
+    run_gh(
+        repo_dir,
+        &[
+            "api", "--method", "POST", &endpoint,
+            "-f", &format!("body={body}"),
+            "-f", &format!("commit_id={head_sha}"),
+            "-f", &format!("path={path}"),
+            "-F", &format!("line={line}"),
+            "-f", &format!("side={side}"),
+        ],
+    )
+    .map(|_| "inline comment posted".into())
+}
+
+/// Replies to an existing review-comment thread.
+pub fn gh_pr_reply(repo_dir: &str, number: &str, comment_id: &str, body: &str) -> Result<String, String> {
+    let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments/{comment_id}/replies");
+    run_gh(repo_dir, &["api", "--method", "POST", &endpoint, "-f", &format!("body={body}")])
+        .map(|_| "reply posted".into())
+}
+
+/// Posts a general conversation comment on the PR.
+pub fn gh_pr_comment_general(repo_dir: &str, number: &str, body: &str) -> Result<String, String> {
+    run_gh(repo_dir, &["pr", "comment", number, "--body", body]).map(|_| "comment posted".into())
+}
+
+/// Submits a review: `kind` ∈ {"approve","request-changes","comment"}.
+pub fn gh_pr_review(repo_dir: &str, number: &str, kind: &str, body: &str) -> Result<String, String> {
+    let flag = match kind {
+        "approve" => "--approve",
+        "request-changes" => "--request-changes",
+        _ => "--comment",
+    };
+    let mut args = vec!["pr", "review", number, flag];
+    if !body.trim().is_empty() {
+        args.push("--body");
+        args.push(body);
     }
+    run_gh(repo_dir, &args).map(|_| format!("review submitted ({kind})"))
+}
+
+/// Merges the PR: `method` ∈ {"merge","squash","rebase"}.
+pub fn gh_pr_merge(repo_dir: &str, number: &str, method: &str) -> Result<String, String> {
+    let flag = match method {
+        "squash" => "--squash",
+        "rebase" => "--rebase",
+        _ => "--merge",
+    };
+    run_gh(repo_dir, &["pr", "merge", number, flag])
 }
 
 /// `log` via **gitoxide (gix)** from an explicit starting commit (hex id).
