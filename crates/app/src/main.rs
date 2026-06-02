@@ -5,16 +5,17 @@
 
 use git_core::blame::BlameLine;
 use git_core::diff::{FileDiff, LineOrigin};
-use git_core::graph::{compute_graph, RowGraph};
+use git_core::graph::{compute_graph, EdgeKind, RowGraph};
 use git_core::rebase::{RebaseAction, RebaseResult, RebaseStep};
 use git_core::{
     AheadBehind, BranchInfo, CommitInfo, ConflictSides, RefKind, RefLabel, ReflogEntry, RemoteInfo,
     StashInfo, StatusEntry, SubmoduleInfo, TagInfo,
 };
 use gpui::{
-    div, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds, ClipboardItem, Context,
-    Entity, FocusHandle, KeyDownEvent, MouseButton, PathPromptOptions, Rgba, ScrollStrategy,
-    SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    canvas, div, point, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds,
+    ClipboardItem, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton, PathBuilder,
+    PathPromptOptions, Rgba, ScrollStrategy, SharedString, UniformListScrollHandle, Window,
+    WindowBounds, WindowOptions,
 };
 use std::collections::HashMap;
 
@@ -284,8 +285,10 @@ struct RebasedApp {
     // ---- Local Changes (M4) ----
     status: Vec<StatusEntry>,
     status_error: Option<String>,
-    /// Working-tree diff of the selected changed file.
+    /// Working-tree diff of the selected changed file (flat, for unified view).
     wt_rows: Vec<DiffRow>,
+    /// Same diff as structured files (for the side-by-side view).
+    wt_diff: Vec<FileDiff>,
     wt_file: Option<String>,
     commit_msg: String,
     commit_focus: FocusHandle,
@@ -421,6 +424,7 @@ impl RebasedApp {
         self.status_error = None;
         self.wt_file = None;
         self.wt_rows.clear();
+        self.wt_diff.clear();
         self.rebase = None;
         self.op_msg = None;
         self.view = ViewMode::Log;
@@ -1092,35 +1096,39 @@ impl RebasedApp {
                 .spawn(async move {
                     let repo = git_core::Repo::open(&path).map_err(|e| e.to_string())?;
                     let status = repo.status().map_err(|e| e.to_string())?;
-                    let rows = match &wt_file {
+                    let (rows, fdiff) = match &wt_file {
                         Some(f) => {
                             // Prefer the unstaged diff; fall back to the staged one.
                             let un = git_core::diff::workdir_diff_ws(&path, false, ignore_ws)
                                 .unwrap_or_default();
                             let mut r = Vec::new();
+                            let mut fdv = Vec::new();
                             if let Some(fd) = un.iter().find(|x| &x.path == f) {
                                 push_file_rows(&mut r, fd, false);
+                                fdv.push(fd.clone());
                             } else {
                                 let st = git_core::diff::workdir_diff_ws(&path, true, ignore_ws)
                                     .unwrap_or_default();
                                 if let Some(fd) = st.iter().find(|x| &x.path == f) {
                                     push_file_rows(&mut r, fd, true);
+                                    fdv.push(fd.clone());
                                 }
                             }
-                            r
+                            (r, fdv)
                         }
-                        None => Vec::new(),
+                        None => (Vec::new(), Vec::new()),
                     };
-                    Ok::<(Vec<StatusEntry>, Vec<DiffRow>), String>((status, rows))
+                    Ok::<(Vec<StatusEntry>, Vec<DiffRow>, Vec<FileDiff>), String>((status, rows, fdiff))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok((s, rows)) => {
+                    Ok((s, rows, fdiff)) => {
                         this.status = s;
                         this.status_error = None;
                         if this.wt_file.is_some() {
                             this.wt_rows = rows;
+                            this.wt_diff = fdiff;
                         }
                     }
                     Err(e) => {
@@ -2417,9 +2425,60 @@ impl RebasedApp {
             }
         }
 
+        // Toggle bar (only when a file's diff is shown).
+        let diff_bar = (!self.wt_rows.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .w_full()
+                .h(px(26.0))
+                .px_2()
+                .bg(color::panel())
+                .border_b_1()
+                .border_color(color::line())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(color::dim())
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(self.wt_file.clone().unwrap_or_default()),
+                )
+                .child(btn("wt-sbs", if self.diff_side_by_side { "Unified" } else { "Side-by-side" }, {
+                    let e = e.clone();
+                    move |app| e.update(app, |t, cx| t.toggle_side_by_side(cx))
+                }))
+                .child(btn("wt-ws", if self.diff_ignore_ws { "WS: ignored" } else { "Ignore WS" }, {
+                    let e = e.clone();
+                    move |app| e.update(app, |t, cx| t.toggle_ignore_ws(cx))
+                }))
+        });
+
         // working-tree diff of the selected file (virtualized)
         let diff_area = if self.wt_rows.is_empty() {
             div().flex_1().min_h_0().p_3().text_color(color::dim()).child("Select a file to view its diff").into_any_element()
+        } else if self.diff_side_by_side {
+            let rows = std::rc::Rc::new(build_side_rows(&self.wt_diff));
+            let n = rows.len();
+            div()
+                .flex_1()
+                .min_h_0()
+                .font_family("Menlo")
+                .text_xs()
+                .child(
+                    uniform_list("wt-side", n, {
+                        let rows = rows.clone();
+                        move |range: std::ops::Range<usize>, _w, _c| {
+                            range.filter_map(|i| rows.get(i).map(side_row_el)).collect::<Vec<_>>()
+                        }
+                    })
+                    .size_full(),
+                )
+                .into_any_element()
         } else {
             let n = self.wt_rows.len();
             div()
@@ -2498,6 +2557,7 @@ impl RebasedApp {
             .flex_1()
             .min_h_0()
             .child(list)
+            .children(diff_bar)
             .child(diff_area)
             .child(commit_box)
             .into_any_element()
@@ -3769,38 +3829,68 @@ fn commit_row(
         )
 }
 
-/// Graph gutter: one vertical line per active lane + the commit dot.
+/// Graph gutter: a `canvas` painting vertical lines + merge/fork curves, with
+/// the commit dot overlaid on top.
 fn graph_gutter(g: &RowGraph, width: usize) -> impl IntoElement {
-    let mut gutter = div()
+    let w = width as f32 * LANE_W;
+    let node_lane = g.lane.min(width.saturating_sub(1));
+    let edges = g.edges.clone();
+
+    let lines = canvas(
+        |_bounds, _w, _cx| {},
+        move |bounds, _, window, _cx| {
+            let x = |col: usize| bounds.origin.x + px(col as f32 * LANE_W + LANE_W / 2.0);
+            let top = bounds.origin.y;
+            let cy = bounds.origin.y + px(ROW_H / 2.0);
+            let bot = bounds.origin.y + px(ROW_H);
+            for e in &edges {
+                let mut pb = PathBuilder::stroke(px(1.6));
+                match e.kind {
+                    EdgeKind::Vertical => {
+                        pb.move_to(point(x(e.col), top));
+                        pb.line_to(point(x(e.col), bot));
+                    }
+                    EdgeKind::IntoNode => {
+                        pb.move_to(point(x(e.col), top));
+                        if e.col == node_lane {
+                            pb.line_to(point(x(node_lane), cy));
+                        } else {
+                            pb.curve_to(point(x(node_lane), cy), point(x(e.col), cy));
+                        }
+                    }
+                    EdgeKind::OutOfNode => {
+                        pb.move_to(point(x(node_lane), cy));
+                        if e.col == node_lane {
+                            pb.line_to(point(x(node_lane), bot));
+                        } else {
+                            pb.curve_to(point(x(e.col), bot), point(x(e.col), cy));
+                        }
+                    }
+                }
+                if let Ok(path) = pb.build() {
+                    window.paint_path(path, Hsla::from(branch_color(e.color)));
+                }
+            }
+        },
+    )
+    .w(px(w))
+    .h(px(ROW_H));
+
+    div()
         .relative()
         .flex_none()
         .h(px(ROW_H))
-        .w(px(width as f32 * LANE_W));
-
-    for (i, lane) in g.lanes.iter().enumerate().take(width) {
-        if let Some(c) = lane {
-            gutter = gutter.child(
-                div()
-                    .absolute()
-                    .top(px(0.0))
-                    .h(px(ROW_H))
-                    .left(px(i as f32 * LANE_W + LANE_W / 2.0 - 1.0))
-                    .w(px(2.0))
-                    .bg(branch_color(*c)),
-            );
-        }
-    }
-
-    let lane = g.lane.min(width.saturating_sub(1));
-    gutter.child(
-        div()
-            .absolute()
-            .left(px(lane as f32 * LANE_W + LANE_W / 2.0 - DOT / 2.0))
-            .top(px(ROW_H / 2.0 - DOT / 2.0))
-            .size(px(DOT))
-            .rounded_full()
-            .bg(branch_color(g.color)),
-    )
+        .w(px(w))
+        .child(lines)
+        .child(
+            div()
+                .absolute()
+                .left(px(node_lane as f32 * LANE_W + LANE_W / 2.0 - DOT / 2.0))
+                .top(px(ROW_H / 2.0 - DOT / 2.0))
+                .size(px(DOT))
+                .rounded_full()
+                .bg(branch_color(g.color)),
+        )
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -3842,6 +3932,7 @@ fn main() {
                         status: Vec::new(),
                         status_error: None,
                         wt_rows: Vec::new(),
+                        wt_diff: Vec::new(),
                         wt_file: None,
                         commit_msg: String::new(),
                         commit_focus: cx.focus_handle(),

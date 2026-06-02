@@ -7,6 +7,25 @@
 
 use crate::CommitInfo;
 
+/// Kind of edge segment within a row's band (top→bottom).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeKind {
+    /// A lane passing straight through this row (top → bottom, same column).
+    Vertical,
+    /// A line entering from the top and converging into the commit dot.
+    IntoNode,
+    /// A line leaving the commit dot toward the bottom (first parent / fork).
+    OutOfNode,
+}
+
+/// One line segment to draw in a row's graph band.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphEdge {
+    pub col: usize,
+    pub color: u32,
+    pub kind: EdgeKind,
+}
+
 /// Layout of one graph row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowGraph {
@@ -15,8 +34,10 @@ pub struct RowGraph {
     /// Dot color (palette index, unbounded; the renderer does `% palette`).
     pub color: u32,
     /// Lanes active when entering this row: `Some(color)` if occupied.
-    /// Used to draw the gutter's vertical lines and merges.
+    /// Used to size the gutter.
     pub lanes: Vec<Option<u32>>,
+    /// Line segments to draw in this row (vertical lines + merge/fork curves).
+    pub edges: Vec<GraphEdge>,
 }
 
 impl RowGraph {
@@ -54,6 +75,15 @@ pub fn compute_graph(commits: &[CommitInfo]) -> Vec<RowGraph> {
             .map(|(i, l)| l.map(|_| colors[i]))
             .collect();
 
+        let mut edges: Vec<GraphEdge> = Vec::new();
+
+        // Incoming: every lane (at the top) expecting this commit converges into the dot.
+        for (i, l) in lanes.iter().enumerate() {
+            if *l == Some(c.id.as_str()) {
+                edges.push(GraphEdge { col: i, color: colors[i], kind: EdgeKind::IntoNode });
+            }
+        }
+
         // 3. Converging merges: other lanes expecting this commit are merged in.
         for i in 0..lanes.len() {
             if i != node_lane && lanes[i] == Some(c.id.as_str()) {
@@ -66,12 +96,31 @@ pub fn compute_graph(commits: &[CommitInfo]) -> Vec<RowGraph> {
             Some(p) => lanes[node_lane] = Some(p.as_str()),
             None => lanes[node_lane] = None,
         }
+        if lanes[node_lane].is_some() {
+            edges.push(GraphEdge { col: node_lane, color: node_color, kind: EdgeKind::OutOfNode });
+        }
 
         // 5. Extra parents (merge): open new lanes if nobody expects them yet.
         for p in c.parents.iter().skip(1) {
-            if !lanes.iter().any(|l| *l == Some(p.as_str())) {
-                let idx = alloc_lane(&mut lanes, &mut colors, &mut next_color);
-                lanes[idx] = Some(p.as_str());
+            let idx = match lanes.iter().position(|l| *l == Some(p.as_str())) {
+                Some(i) => i,
+                None => {
+                    let i = alloc_lane(&mut lanes, &mut colors, &mut next_color);
+                    lanes[i] = Some(p.as_str());
+                    i
+                }
+            };
+            edges.push(GraphEdge { col: idx, color: colors[idx], kind: EdgeKind::OutOfNode });
+        }
+
+        // Pass-through lanes: occupied both before and after, untouched by this commit.
+        for (i, l) in lanes.iter().enumerate() {
+            if i != node_lane
+                && l.is_some()
+                && snapshot.get(i).copied().flatten().is_some()
+                && !edges.iter().any(|e| e.col == i)
+            {
+                edges.push(GraphEdge { col: i, color: colors[i], kind: EdgeKind::Vertical });
             }
         }
 
@@ -79,6 +128,7 @@ pub fn compute_graph(commits: &[CommitInfo]) -> Vec<RowGraph> {
             lane: node_lane,
             color: node_color,
             lanes: snapshot,
+            edges,
         });
     }
     out
