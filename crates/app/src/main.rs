@@ -7,11 +7,13 @@ use git_core::blame::BlameLine;
 use git_core::diff::{FileDiff, LineOrigin};
 use git_core::graph::{compute_graph, RowGraph};
 use git_core::rebase::{RebaseAction, RebaseResult, RebaseStep};
-use git_core::{BranchInfo, CommitInfo, StatusEntry};
+use git_core::{AheadBehind, BranchInfo, CommitInfo, RefKind, RefLabel, StatusEntry};
 use gpui::{
-    div, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds, Context, Entity,
-    FocusHandle, KeyDownEvent, Rgba, SharedString, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds, ClipboardItem, Context,
+    Entity, FocusHandle, KeyDownEvent, MouseButton, PathPromptOptions, Rgba, ScrollStrategy,
+    SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
+use std::collections::HashMap;
 
 const ROW_H: f32 = 24.0;
 const LANE_W: f32 = 14.0;
@@ -61,6 +63,51 @@ struct PlanRow {
 struct RebasePlan {
     base: String,
     steps: Vec<PlanRow>,
+}
+
+/// A context menu open over a commit row in the log.
+struct CommitMenu {
+    ix: usize,
+    pos: gpui::Point<gpui::Pixels>,
+}
+
+/// A modal text prompt (branch/tag name, reword message, go-to-hash, …).
+struct Prompt {
+    title: String,
+    value: String,
+    kind: PromptKind,
+    focus: FocusHandle,
+}
+
+/// What a [`Prompt`] does on submit.
+#[derive(Clone)]
+enum PromptKind {
+    BranchAt(String),
+    TagAt(String),
+    Reword(String),
+    GoToHash,
+    AddRemote,
+    RenameBranch(String),
+    SetUpstream(String),
+}
+
+/// A small colored chip for a ref (branch/tag/HEAD) on a commit row.
+fn ref_chip(l: &RefLabel) -> impl IntoElement {
+    let (bg, fg, prefix) = match l.kind {
+        RefKind::Head => (color::accent(), rgb(0xffffff), "● "),
+        RefKind::LocalBranch => (rgb(0x2f5b3f), rgb(0xcfe8c0), ""),
+        RefKind::RemoteBranch => (rgb(0x3a3550), rgb(0xc8b8ec), ""),
+        RefKind::Tag => (rgb(0x4a3f24), rgb(0xe6c46a), "⌗ "),
+    };
+    div()
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .bg(bg)
+        .text_color(fg)
+        .text_xs()
+        .whitespace_nowrap()
+        .child(format!("{prefix}{}", l.name))
 }
 
 /// Graph branch colors (cycled by lane index).
@@ -143,9 +190,367 @@ struct RebasedApp {
 
     // ---- Interactive rebase (M6) ----
     rebase: Option<RebasePlan>,
+
+    // ---- Repo session / shell ----
+    /// `false` until a repo is open (then the welcome screen shows).
+    repo_loaded: bool,
+    /// Display name of the open repo (window title + toolbar).
+    repo_name: String,
+    /// Set when the window title needs refreshing (applied during render).
+    title_dirty: bool,
+    /// Most-recently-opened repo paths (persisted to disk).
+    recents: Vec<String>,
+    /// Refs (branches/tags/HEAD) by commit id → colored chips in the log.
+    refs: HashMap<String, Vec<RefLabel>>,
+    /// Scroll handle for the log list (powers "go to hash"/"scroll to commit").
+    log_scroll: UniformListScrollHandle,
+    /// HEAD ahead/behind its upstream (status bar).
+    ahead_behind: Option<AheadBehind>,
+
+    // ---- Log: context menu, modal prompt, filter ----
+    /// Right-click menu over a commit, if open.
+    menu: Option<CommitMenu>,
+    /// Modal text prompt, if open.
+    prompt: Option<Prompt>,
+    /// Set once after opening a prompt, to focus its input during render.
+    focus_prompt: bool,
+    /// Live log filter (substring of message/author/hash). Empty = no filter.
+    log_filter: String,
+    log_filter_focus: FocusHandle,
+    /// Commit indices matching `log_filter` (only used when it's non-empty).
+    filtered: Vec<usize>,
 }
 
 impl RebasedApp {
+    /// Opens (or switches to) a repo at `path`, resetting all per-repo state.
+    /// Synchronous: the log/graph/refs load is fast even on huge repos.
+    fn load_repo(&mut self, path: &str) {
+        let path = path.to_string();
+        match git_core::gix_log(&path, 50_000) {
+            Ok(commits) => {
+                self.graph = compute_graph(&commits);
+                self.graph_width = self
+                    .graph
+                    .iter()
+                    .map(|r| r.width())
+                    .max()
+                    .unwrap_or(1)
+                    .clamp(1, MAX_LANES);
+                self.commits = commits;
+                self.error = None;
+                self.repo_loaded = true;
+            }
+            Err(e) => {
+                self.commits.clear();
+                self.graph.clear();
+                self.error = Some(format!("Could not open repo: {e}"));
+                self.repo_loaded = false;
+                self.repo_path = path;
+                return;
+            }
+        }
+        self.repo_path = path.clone();
+
+        // Refs (chips) + branches + ahead/behind.
+        self.refs = git_core::Repo::open(&path)
+            .and_then(|r| r.refs_by_commit())
+            .unwrap_or_default();
+        if let Ok(repo) = git_core::Repo::open(&path) {
+            self.branches = repo.branches().unwrap_or_default();
+            self.ahead_behind = repo.ahead_behind().ok();
+        }
+
+        // Reset per-commit / per-view state.
+        self.selected = None;
+        self.diff.clear();
+        self.diff_rows.clear();
+        self.diff_error = None;
+        self.blame = None;
+        self.status.clear();
+        self.status_error = None;
+        self.wt_file = None;
+        self.wt_rows.clear();
+        self.rebase = None;
+        self.op_msg = None;
+        self.view = ViewMode::Log;
+
+        // Pre-warm the latest commit's diff and select it.
+        if let Some(c) = self.commits.first() {
+            let id = c.id.clone();
+            if let Ok(files) = git_core::diff::commit_diff(&path, &id) {
+                self.diff_rows = build_diff_rows(&files);
+                self.diff = files;
+                self.selected = Some(0);
+            }
+        }
+
+        // Window title + recents.
+        self.repo_name = repo_display_name(&path);
+        self.title_dirty = true;
+        let canon = std::fs::canonicalize(&path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.clone());
+        self.recents.retain(|p| p != &canon);
+        self.recents.insert(0, canon);
+        self.recents.truncate(12);
+        save_recents(&self.recents);
+    }
+
+    /// Native folder picker → open the chosen repo.
+    fn open_dialog(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(p) = paths.into_iter().next() {
+                    let path = p.to_string_lossy().into_owned();
+                    let _ = this.update(cx, |t, cx| {
+                        t.load_repo(&path);
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Opens a repo from the recents list.
+    fn open_recent(&mut self, path: String, cx: &mut Context<Self>) {
+        self.load_repo(&path);
+        cx.notify();
+    }
+
+    // ---- Log: context menu over a commit ----
+    fn open_commit_menu(&mut self, ix: usize, pos: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        self.menu = Some(CommitMenu { ix, pos });
+        cx.notify();
+    }
+
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn copy_hash(&mut self, id: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
+        self.op_msg = Some(format!("Copied {}", short(&id)));
+        self.menu = None;
+        cx.notify();
+    }
+
+    fn checkout_revision(&mut self, id: String, cx: &mut Context<Self>) {
+        self.menu = None;
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|repo| repo.checkout_commit(&id))
+            .map(|_| format!("checkout {}", short(&id)));
+        self.branch_op(r, cx);
+    }
+
+    fn reset_here(&mut self, id: String, mode: git_core::ResetMode, cx: &mut Context<Self>) {
+        self.menu = None;
+        let label = format!("reset {} {}", reset_label(mode), short(&id));
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|repo| repo.reset(&id, mode))
+            .map(|_| label);
+        self.branch_op(r, cx);
+    }
+
+    fn cherry_pick_at(&mut self, id: String, cx: &mut Context<Self>) {
+        self.menu = None;
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|repo| repo.cherry_pick(&id))
+            .map(|_| format!("cherry-pick {} (staged)", short(&id)));
+        self.branch_op(r, cx);
+    }
+
+    fn revert_at(&mut self, id: String, cx: &mut Context<Self>) {
+        self.menu = None;
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|repo| repo.revert_commit(&id))
+            .map(|_| format!("revert {} (staged)", short(&id)));
+        self.branch_op(r, cx);
+    }
+
+    fn rebase_from(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.start_rebase(ix, cx);
+    }
+
+    // ---- Modal text prompt (reused across the app) ----
+    fn open_prompt(&mut self, title: &str, initial: &str, kind: PromptKind, cx: &mut Context<Self>) {
+        self.prompt = Some(Prompt {
+            title: title.to_string(),
+            value: initial.to_string(),
+            kind,
+            focus: cx.focus_handle(),
+        });
+        self.focus_prompt = true;
+        self.menu = None;
+        cx.notify();
+    }
+
+    fn cancel_prompt(&mut self, cx: &mut Context<Self>) {
+        self.prompt = None;
+        cx.notify();
+    }
+
+    fn on_prompt_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        match ev.keystroke.key.as_str() {
+            "enter" => {
+                self.submit_prompt(cx);
+                return;
+            }
+            "escape" => {
+                self.prompt = None;
+                cx.notify();
+                return;
+            }
+            _ => {}
+        }
+        if let Some(p) = &mut self.prompt {
+            edit_key(&mut p.value, ev, false);
+        }
+        cx.notify();
+    }
+
+    fn submit_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(p) = self.prompt.take() else { return };
+        let v = p.value.trim().to_string();
+        match p.kind {
+            PromptKind::BranchAt(id) => {
+                if v.is_empty() {
+                    return;
+                }
+                let r = git_core::Repo::open(&self.repo_path)
+                    .and_then(|repo| repo.create_branch_at(&v, &id))
+                    .map(|_| format!("branch {v}"));
+                self.branch_op(r, cx);
+            }
+            PromptKind::TagAt(id) => {
+                if v.is_empty() {
+                    return;
+                }
+                let r = git_core::Repo::open(&self.repo_path)
+                    .and_then(|repo| repo.create_tag(&v, &id, None))
+                    .map(|_| format!("tag {v}"));
+                self.branch_op(r, cx);
+            }
+            PromptKind::Reword(id) => self.reword_commit(&id, &v, cx),
+            PromptKind::GoToHash => self.go_to_hash(&v, cx),
+            PromptKind::AddRemote => {
+                let mut it = v.split_whitespace();
+                if let (Some(name), Some(url)) = (it.next(), it.next()) {
+                    let r = git_core::Repo::open(&self.repo_path)
+                        .and_then(|repo| repo.add_remote(name, url))
+                        .map(|_| format!("remote add {name}"));
+                    self.branch_op(r, cx);
+                } else {
+                    self.op_msg = Some("Format: <name> <url>".into());
+                    cx.notify();
+                }
+            }
+            PromptKind::RenameBranch(old) => {
+                if v.is_empty() {
+                    return;
+                }
+                let r = git_core::Repo::open(&self.repo_path)
+                    .and_then(|repo| repo.rename_branch(&old, &v))
+                    .map(|_| format!("rename {old} → {v}"));
+                self.branch_op(r, cx);
+            }
+            PromptKind::SetUpstream(branch) => {
+                let up = if v.is_empty() { None } else { Some(v.as_str()) };
+                let r = git_core::Repo::open(&self.repo_path)
+                    .and_then(|repo| repo.set_upstream(&branch, up))
+                    .map(|_| format!("upstream {branch} → {v}"));
+                self.branch_op(r, cx);
+            }
+        }
+    }
+
+    fn go_to_hash(&mut self, q: &str, cx: &mut Context<Self>) {
+        let q = q.trim();
+        if let Some(ix) = self.commits.iter().position(|c| c.id.starts_with(q)) {
+            self.log_scroll.scroll_to_item(ix, ScrollStrategy::Center);
+            self.select(ix, cx);
+        } else {
+            self.op_msg = Some(format!("No commit matching {q}"));
+            cx.notify();
+        }
+    }
+
+    fn reword_commit(&mut self, id: &str, msg: &str, cx: &mut Context<Self>) {
+        let Some(ix) = self.commits.iter().position(|c| c.id == id) else { return };
+        let Some(base) = self.commits[ix].parents.first().cloned() else {
+            self.op_msg = Some("Cannot reword the root commit".into());
+            cx.notify();
+            return;
+        };
+        let steps: Vec<RebaseStep> = self.commits[0..=ix]
+            .iter()
+            .rev()
+            .map(|c| RebaseStep {
+                commit: c.id.clone(),
+                action: if c.id == id {
+                    RebaseAction::Reword(msg.to_string())
+                } else {
+                    RebaseAction::Pick
+                },
+            })
+            .collect();
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|repo| repo.rebase_interactive(&base, &steps));
+        self.op_msg = Some(match r {
+            Ok(RebaseResult::Done(h)) => format!("✓ reworded → {}", short(&h)),
+            Ok(RebaseResult::Conflict(c)) => format!("✗ conflict at {}", short(&c)),
+            Err(e) => format!("✗ {e}"),
+        });
+        self.reload_log();
+        cx.notify();
+    }
+
+    // ---- Log filter / search ----
+    fn on_filter_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        if ev.keystroke.key == "enter" {
+            let q = self.log_filter.trim().to_string();
+            if q.len() >= 4 && q.chars().all(|c| c.is_ascii_hexdigit()) {
+                self.go_to_hash(&q, cx);
+            }
+            return;
+        }
+        if ev.keystroke.key == "escape" {
+            self.log_filter.clear();
+        } else {
+            edit_key(&mut self.log_filter, ev, false);
+        }
+        self.recompute_filter();
+        cx.notify();
+    }
+
+    fn recompute_filter(&mut self) {
+        let q = self.log_filter.trim().to_lowercase();
+        if q.is_empty() {
+            self.filtered.clear();
+            return;
+        }
+        self.filtered = self
+            .commits
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.summary.to_lowercase().contains(&q)
+                    || c.author.to_lowercase().contains(&q)
+                    || c.id.starts_with(&q)
+            })
+            .map(|(i, _)| i)
+            .collect();
+    }
+
     /// Selects a commit and loads its diff (reopens the repo: ~1 ms).
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
         if self.selected == Some(ix) {
@@ -393,6 +798,13 @@ impl RebasedApp {
                 .clamp(1, MAX_LANES);
             self.commits = commits;
         }
+        // Refresh ref chips + ahead/behind so the log and status bar stay current.
+        self.refs = git_core::Repo::open(&self.repo_path)
+            .and_then(|r| r.refs_by_commit())
+            .unwrap_or_default();
+        if let Ok(repo) = git_core::Repo::open(&self.repo_path) {
+            self.ahead_behind = repo.ahead_behind().ok();
+        }
     }
 
     // ---- Remote (M7) / Stash (M8) ----
@@ -551,8 +963,46 @@ fn first_line(s: &str) -> String {
     s.lines().find(|l| !l.trim().is_empty()).unwrap_or("ok").to_string()
 }
 
+/// Last path component of the (canonicalized) repo path, for title/toolbar.
+fn repo_display_name(path: &str) -> String {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
+    canon
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| canon.to_string_lossy().into_owned())
+}
+
+/// `~/.config/diff/recents.txt` — the persisted recent-repos list.
+fn recents_file() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let dir = std::path::Path::new(&home).join(".config").join("diff");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("recents.txt"))
+}
+
+fn load_recents() -> Vec<String> {
+    recents_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+fn save_recents(recents: &[String]) {
+    if let Some(p) = recents_file() {
+        let _ = std::fs::write(p, recents.join("\n"));
+    }
+}
+
 fn short(id: &str) -> String {
     id.get(..7).unwrap_or(id).to_string()
+}
+
+fn reset_label(mode: git_core::ResetMode) -> &'static str {
+    match mode {
+        git_core::ResetMode::Soft => "--soft",
+        git_core::ResetMode::Mixed => "--mixed",
+        git_core::ResetMode::Hard => "--hard",
+    }
 }
 
 /// Formats Unix seconds to `YYYY-MM-DD` (Hinnant's civil algorithm, no deps).
@@ -572,7 +1022,37 @@ fn fmt_date(secs: i64) -> String {
 }
 
 impl Render for RebasedApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Apply a pending window-title change (cheap; only when it changed).
+        if self.title_dirty {
+            let title = if self.repo_name.is_empty() {
+                "diff".to_string()
+            } else {
+                format!("{} — diff", self.repo_name)
+            };
+            window.set_window_title(&title);
+            self.title_dirty = false;
+        }
+
+        // No repo open yet → welcome screen.
+        if !self.repo_loaded {
+            return div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .bg(color::bg())
+                .text_color(color::fg())
+                .child(self.render_welcome(cx));
+        }
+
+        // Focus a freshly-opened modal prompt's input.
+        if self.focus_prompt {
+            if let Some(p) = &self.prompt {
+                window.focus(&p.focus);
+            }
+            self.focus_prompt = false;
+        }
+
         let toolbar = self.render_toolbar(cx);
         let body = if self.rebase.is_some() {
             self.render_rebase_editor(cx)
@@ -583,6 +1063,7 @@ impl Render for RebasedApp {
                 ViewMode::Branches => self.render_branches(cx),
             }
         };
+        let overlays = self.render_overlays(cx);
         let toast = self.op_msg.clone().map(|m| {
             div()
                 .w_full()
@@ -605,10 +1086,270 @@ impl Render for RebasedApp {
             .child(toolbar)
             .child(body)
             .children(toast)
+            .children(overlays)
     }
 }
 
 impl RebasedApp {
+    /// Welcome screen (shown when no repo is open): logo, Open button, recents.
+    fn render_welcome(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        let mut recents = div().flex().flex_col().gap_1().w(px(620.0));
+        if self.recents.is_empty() {
+            recents = recents.child(
+                div()
+                    .px_3()
+                    .text_color(color::dim())
+                    .text_sm()
+                    .child("No recent repositories"),
+            );
+        } else {
+            for path in &self.recents {
+                let p = path.clone();
+                let e2 = e.clone();
+                let name = repo_display_name(path);
+                recents = recents.child(
+                    div()
+                        .id(SharedString::from(format!("recent-{path}")))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .w_full()
+                        .px_3()
+                        .h(px(38.0))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(color::hover()))
+                        .on_click(move |_, _, app| {
+                            let p = p.clone();
+                            e2.update(app, |t, cx| t.open_recent(p, cx));
+                        })
+                        .child(div().flex_none().w(px(160.0)).whitespace_nowrap().text_ellipsis().text_color(color::fg()).child(name))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_color(color::dim())
+                                .text_sm()
+                                .child(path.clone()),
+                        ),
+                );
+            }
+        }
+        let err = self
+            .error
+            .clone()
+            .map(|m| div().px_3().text_color(color::err()).text_sm().child(m));
+
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .size_full()
+            .child(div().text_color(color::accent()).text_2xl().child("⎇ diff"))
+            .child(div().text_color(color::dim()).child("A fast, native git client"))
+            .child(
+                div().mt_2().child(btn("welcome-open", "Open repository…", {
+                    let e = e.clone();
+                    move |app| {
+                        e.update(app, |t, cx| t.open_dialog(cx));
+                    }
+                })),
+            )
+            .children(err)
+            .child(div().mt_4().text_color(color::dim()).text_sm().child("Recent"))
+            .child(recents)
+            .into_any_element()
+    }
+
+    /// Floating overlays (commit context menu, modal prompt) drawn on top.
+    fn render_overlays(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let mut out = Vec::new();
+        if let Some(menu) = &self.menu {
+            out.push(self.render_commit_menu(menu, cx));
+        }
+        if let Some(prompt) = &self.prompt {
+            out.push(self.render_prompt(prompt, cx));
+        }
+        out
+    }
+
+    /// Right-click context menu over a commit (actions from the log).
+    fn render_commit_menu(&self, menu: &CommitMenu, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        let Some(commit) = self.commits.get(menu.ix) else {
+            return div().into_any_element();
+        };
+        let id = commit.id.clone();
+        let summary = commit.summary.clone();
+        let ix = menu.ix;
+
+        let sep = || div().w_full().h(px(1.0)).my_1().bg(color::line());
+
+        let panel = div()
+            .flex()
+            .flex_col()
+            .w(px(232.0))
+            .bg(color::panel())
+            .border_1()
+            .border_color(color::line())
+            .rounded_md()
+            .py_1()
+            .child(menu_row("m-co", "Checkout this commit", {
+                let (e, id) = (e.clone(), id.clone());
+                move |app| e.update(app, |t, cx| t.checkout_revision(id.clone(), cx))
+            }))
+            .child(menu_row("m-branch", "New branch here…", {
+                let (e, id) = (e.clone(), id.clone());
+                move |app| e.update(app, |t, cx| t.open_prompt("New branch at this commit", "", PromptKind::BranchAt(id.clone()), cx))
+            }))
+            .child(menu_row("m-tag", "New tag here…", {
+                let (e, id) = (e.clone(), id.clone());
+                move |app| e.update(app, |t, cx| t.open_prompt("New tag at this commit", "", PromptKind::TagAt(id.clone()), cx))
+            }))
+            .child(menu_row("m-reword", "Reword…", {
+                let (e, id, summary) = (e.clone(), id.clone(), summary.clone());
+                move |app| e.update(app, |t, cx| t.open_prompt("Reword commit message", &summary, PromptKind::Reword(id.clone()), cx))
+            }))
+            .child(sep())
+            .child(menu_row("m-cp", "Cherry-pick onto current", {
+                let (e, id) = (e.clone(), id.clone());
+                move |app| e.update(app, |t, cx| t.cherry_pick_at(id.clone(), cx))
+            }))
+            .child(menu_row("m-revert", "Revert this commit", {
+                let (e, id) = (e.clone(), id.clone());
+                move |app| e.update(app, |t, cx| t.revert_at(id.clone(), cx))
+            }))
+            .child(menu_row("m-rebase", "Rebase from here…", {
+                let e = e.clone();
+                move |app| e.update(app, |t, cx| t.rebase_from(ix, cx))
+            }))
+            .child(sep())
+            .child(menu_row("m-soft", "Reset --soft to here", {
+                let (e, id) = (e.clone(), id.clone());
+                move |app| e.update(app, |t, cx| t.reset_here(id.clone(), git_core::ResetMode::Soft, cx))
+            }))
+            .child(menu_row("m-mixed", "Reset --mixed to here", {
+                let (e, id) = (e.clone(), id.clone());
+                move |app| e.update(app, |t, cx| t.reset_here(id.clone(), git_core::ResetMode::Mixed, cx))
+            }))
+            .child(menu_row("m-hard", "Reset --hard to here", {
+                let (e, id) = (e.clone(), id.clone());
+                move |app| e.update(app, |t, cx| t.reset_here(id.clone(), git_core::ResetMode::Hard, cx))
+            }))
+            .child(sep())
+            .child(menu_row("m-copy", "Copy commit hash", {
+                let (e, id) = (e.clone(), id.clone());
+                move |app| e.update(app, |t, cx| t.copy_hash(id.clone(), cx))
+            }));
+
+        let backdrop = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_mouse_down(MouseButton::Left, {
+                let e = e.clone();
+                move |_, _, app| e.update(app, |t, cx| t.close_menu(cx))
+            })
+            .on_mouse_down(MouseButton::Right, {
+                let e = e.clone();
+                move |_, _, app| e.update(app, |t, cx| t.close_menu(cx))
+            });
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(backdrop)
+            .child(gpui::anchored().position(menu.pos).child(panel))
+            .into_any_element()
+    }
+
+    /// Modal text prompt (branch/tag name, reword, etc.).
+    fn render_prompt(&self, p: &Prompt, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        let backdrop = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(rgb(0x000000))
+            .opacity(0.4)
+            .on_mouse_down(MouseButton::Left, {
+                let e = e.clone();
+                move |_, _, app| e.update(app, |t, cx| t.cancel_prompt(cx))
+            });
+
+        let panel = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w(px(440.0))
+            .bg(color::panel())
+            .border_1()
+            .border_color(color::line())
+            .rounded_md()
+            .p_3()
+            .child(div().text_color(color::fg()).child(p.title.clone()))
+            .child(
+                div()
+                    .id("prompt-input")
+                    .w_full()
+                    .min_h(px(30.0))
+                    .px_2()
+                    .py_1()
+                    .bg(color::bg())
+                    .rounded_md()
+                    .border_1()
+                    .border_color(color::accent())
+                    .track_focus(&p.focus)
+                    .key_context("prompt")
+                    .on_key_down(cx.listener(Self::on_prompt_key))
+                    .font_family("Menlo")
+                    .text_sm()
+                    .text_color(if p.value.is_empty() { color::dim() } else { color::fg() })
+                    .child(if p.value.is_empty() {
+                        "type…".to_string()
+                    } else {
+                        format!("{}▏", p.value)
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap_2()
+                    .child(btn("prompt-cancel", "Cancel", {
+                        let e = e.clone();
+                        move |app| e.update(app, |t, cx| t.cancel_prompt(cx))
+                    }))
+                    .child(btn("prompt-ok", "OK", {
+                        let e = e.clone();
+                        move |app| e.update(app, |t, cx| t.submit_prompt(cx))
+                    })),
+            );
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(backdrop)
+            .child(panel)
+            .into_any_element()
+    }
+
     /// Top bar: tabs (Log/Changes/Branches) + network/stash actions.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let e = cx.entity();
@@ -640,6 +1381,27 @@ impl RebasedApp {
             .find(|b| b.is_head)
             .map(|b| b.name.clone())
             .unwrap_or_default();
+        let ab = self
+            .ahead_behind
+            .map(|a| {
+                let mut s = String::new();
+                if a.ahead > 0 {
+                    s.push_str(&format!("↑{}", a.ahead));
+                }
+                if a.behind > 0 {
+                    if !s.is_empty() {
+                        s.push(' ');
+                    }
+                    s.push_str(&format!("↓{}", a.behind));
+                }
+                s
+            })
+            .unwrap_or_default();
+        let head_label = if cur.is_empty() {
+            String::new()
+        } else {
+            format!("⎇ {cur}   {ab}")
+        };
 
         div()
             .flex()
@@ -652,11 +1414,25 @@ impl RebasedApp {
             .bg(color::panel())
             .border_b_1()
             .border_color(color::line())
-            .child(div().px_2().text_color(color::accent()).child("diff"))
+            .child(btn("tb-open", "Open", {
+                let e = e.clone();
+                move |app| {
+                    e.update(app, |t, cx| t.open_dialog(cx));
+                }
+            }))
+            .child(
+                div()
+                    .px_1()
+                    .max_w(px(150.0))
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_color(color::accent())
+                    .child(self.repo_name.clone()),
+            )
             .child(tab("Log", ViewMode::Log))
             .child(tab("Changes", ViewMode::Changes))
             .child(tab("Branches", ViewMode::Branches))
-            .child(div().flex_1().min_w_0().text_color(color::dim()).text_sm().px_2().whitespace_nowrap().text_ellipsis().child(if cur.is_empty() { String::new() } else { format!("⎇ {cur}") }))
+            .child(div().flex_1().min_w_0().text_color(color::dim()).text_sm().px_2().whitespace_nowrap().text_ellipsis().child(head_label))
             .child(btn("tb-fetch", "Fetch", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.run_remote("fetch", cx)); } }))
             .child(btn("tb-pull", "Pull", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.run_remote("pull", cx)); } }))
             .child(btn("tb-push", "Push", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.run_remote("push", cx)); } }))
@@ -664,9 +1440,12 @@ impl RebasedApp {
             .into_any_element()
     }
 
-    /// Log view: virtualized log graph + diff/blame panel.
+    /// Log view: filter bar + virtualized log graph + diff/blame panel.
     fn render_log(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entity = cx.entity();
+        let filtering = !self.log_filter.trim().is_empty();
+        let count = if filtering { self.filtered.len() } else { self.commits.len() };
+
         let log = match &self.error {
             Some(e) => div().flex_1().p_3().text_color(color::err()).child(e.clone()).into_any_element(),
             None => div()
@@ -675,26 +1454,89 @@ impl RebasedApp {
                 .child(
                     uniform_list(
                         "commit-log",
-                        self.commits.len(),
+                        count,
                         cx.processor(move |this, range: std::ops::Range<usize>, _w, _c| {
+                            let filtering = !this.log_filter.trim().is_empty();
                             range
-                                .map(|ix| {
-                                    commit_row(
+                                .filter_map(|pos| {
+                                    let ix = if filtering {
+                                        this.filtered.get(pos).copied()?
+                                    } else {
+                                        pos
+                                    };
+                                    let labels = this
+                                        .refs
+                                        .get(&this.commits[ix].id)
+                                        .map(Vec::as_slice)
+                                        .unwrap_or(&[]);
+                                    Some(commit_row(
                                         &this.commits[ix],
                                         &this.graph[ix],
                                         this.graph_width,
                                         ix,
                                         this.selected == Some(ix),
+                                        labels,
                                         entity.clone(),
-                                    )
+                                    ))
                                 })
                                 .collect::<Vec<_>>()
                         }),
                     )
+                    .track_scroll(self.log_scroll.clone())
                     .size_full(),
                 )
                 .into_any_element(),
         };
+
+        let filter_bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .h(px(32.0))
+            .px_2()
+            .bg(color::panel())
+            .border_b_1()
+            .border_color(color::line())
+            .child(div().flex_none().text_color(color::dim()).text_sm().child("⌕"))
+            .child(
+                div()
+                    .id("log-filter")
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(22.0))
+                    .px_2()
+                    .bg(color::bg())
+                    .rounded_md()
+                    .border_1()
+                    .border_color(color::line())
+                    .track_focus(&self.log_filter_focus)
+                    .key_context("logfilter")
+                    .on_key_down(cx.listener(Self::on_filter_key))
+                    .on_click(cx.listener(|this, _, window, _| window.focus(&this.log_filter_focus)))
+                    .text_sm()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_color(if self.log_filter.is_empty() { color::dim() } else { color::fg() })
+                    .child(if self.log_filter.is_empty() {
+                        "Filter by message / author / hash — Enter on a hash to jump".to_string()
+                    } else {
+                        self.log_filter.clone()
+                    }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(color::dim())
+                    .child(if filtering {
+                        format!("{} / {}", count, self.commits.len())
+                    } else {
+                        format!("{} commits", self.commits.len())
+                    }),
+            );
+
         let header = div()
             .flex()
             .flex_row()
@@ -718,6 +1560,7 @@ impl RebasedApp {
             .flex_col()
             .flex_1()
             .min_h_0()
+            .child(filter_bar)
             .child(header)
             .child(log)
             .child(self.render_diff_panel(cx))
@@ -1054,6 +1897,21 @@ fn action_label(a: &RebaseAction) -> &'static str {
     }
 }
 
+/// A full-width left-aligned menu row (context menus).
+fn menu_row(key: &str, label: &str, on: impl Fn(&mut App) + 'static) -> impl IntoElement {
+    div()
+        .id(SharedString::from(key.to_string()))
+        .w_full()
+        .px_3()
+        .py_1()
+        .text_sm()
+        .cursor_pointer()
+        .text_color(color::fg())
+        .hover(|s| s.bg(color::hover()))
+        .on_click(move |_, _, app| on(app))
+        .child(label.to_string())
+}
+
 /// Small UI button.
 fn btn(id: &str, label: &str, on: impl Fn(&mut App) + 'static) -> impl IntoElement {
     div()
@@ -1338,9 +2196,21 @@ fn commit_row(
     graph_width: usize,
     ix: usize,
     selected: bool,
+    labels: &[RefLabel],
     entity: Entity<RebasedApp>,
 ) -> impl IntoElement {
     let short_id = c.id.get(..8).unwrap_or(&c.id).to_string();
+    let chips_box = if labels.is_empty() {
+        None
+    } else {
+        let mut b = div().flex().flex_row().items_center().gap_1().flex_none();
+        for l in labels {
+            b = b.child(ref_chip(l));
+        }
+        Some(b)
+    };
+    let e_sel = entity.clone();
+    let e_menu = entity;
     let mut row = div()
         .id(ix)
         .flex()
@@ -1355,12 +2225,17 @@ fn commit_row(
         .cursor_pointer()
         .hover(|s| s.bg(color::hover()))
         .on_click(move |_event, _window, app| {
-            entity.update(app, |this, cx| this.select(ix, cx));
+            e_sel.update(app, |this, cx| this.select(ix, cx));
+        })
+        .on_mouse_down(MouseButton::Right, move |ev, _w, app| {
+            let pos = ev.position;
+            e_menu.update(app, |this, cx| this.open_commit_menu(ix, pos, cx));
         });
     if selected {
         row = row.bg(color::sel());
     }
     row.child(graph_gutter(g, graph_width))
+        .children(chips_box)
         .child(
             div()
                 .flex_1()
@@ -1446,69 +2321,60 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 fn main() {
-    let repo_path = std::env::args().nth(1).unwrap_or_else(|| ".".into());
-    let limit: usize = std::env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50_000);
-
-    let (commits, graph, graph_width, error) = match git_core::gix_log(&repo_path, limit) {
-        Ok(commits) => {
-            let graph = compute_graph(&commits);
-            let width = graph
-                .iter()
-                .map(|r| r.width())
-                .max()
-                .unwrap_or(1)
-                .clamp(1, MAX_LANES);
-            (commits, graph, width, None)
-        }
-        Err(e) => (Vec::new(), Vec::new(), 1, Some(format!("Could not open repo: {e}"))),
-    };
-
-    // Pre-warm the most recent commit's diff: leaves the gix repo cache
-    // warm on the UI thread (subsequent clicks are instant) and shows
-    // its diff by default, like Rebased does.
-    let (selected, diff) = match commits.first() {
-        Some(c) => match git_core::diff::commit_diff(&repo_path, &c.id) {
-            Ok(d) => (Some(0usize), d),
-            Err(_) => (None, Vec::new()),
-        },
-        None => (None, Vec::new()),
-    };
-    let diff_rows = build_diff_rows(&diff);
+    // Optional repo path argument; otherwise the welcome screen shows.
+    let initial = std::env::args().nth(1);
+    let recents = load_recents();
 
     Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1100.0), px(760.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1180.0), px(800.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
             move |_, cx| {
-                cx.new(move |cx| RebasedApp {
-                    repo_path,
-                    commits,
-                    graph,
-                    graph_width,
-                    error,
-                    selected,
-                    diff,
-                    diff_rows,
-                    diff_error: None,
-                    blame: None,
-                    view: ViewMode::Log,
-                    op_msg: None,
-                    status: Vec::new(),
-                    status_error: None,
-                    wt_rows: Vec::new(),
-                    wt_file: None,
-                    commit_msg: String::new(),
-                    commit_focus: cx.focus_handle(),
-                    branches: Vec::new(),
-                    new_branch: String::new(),
-                    branch_focus: cx.focus_handle(),
-                    rebase: None,
+                cx.new(move |cx| {
+                    let mut app = RebasedApp {
+                        repo_path: String::new(),
+                        commits: Vec::new(),
+                        graph: Vec::new(),
+                        graph_width: 1,
+                        error: None,
+                        selected: None,
+                        diff: Vec::new(),
+                        diff_rows: Vec::new(),
+                        diff_error: None,
+                        blame: None,
+                        view: ViewMode::Log,
+                        op_msg: None,
+                        status: Vec::new(),
+                        status_error: None,
+                        wt_rows: Vec::new(),
+                        wt_file: None,
+                        commit_msg: String::new(),
+                        commit_focus: cx.focus_handle(),
+                        branches: Vec::new(),
+                        new_branch: String::new(),
+                        branch_focus: cx.focus_handle(),
+                        rebase: None,
+                        repo_loaded: false,
+                        repo_name: String::new(),
+                        title_dirty: true,
+                        recents,
+                        refs: HashMap::new(),
+                        log_scroll: UniformListScrollHandle::new(),
+                        ahead_behind: None,
+                        menu: None,
+                        prompt: None,
+                        focus_prompt: false,
+                        log_filter: String::new(),
+                        log_filter_focus: cx.focus_handle(),
+                        filtered: Vec::new(),
+                    };
+                    if let Some(p) = initial {
+                        app.load_repo(&p);
+                    }
+                    app
                 })
             },
         )
