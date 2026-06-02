@@ -5,6 +5,7 @@
 //! migrated to `gitoxide` and benchmarked — but this layer exposes
 //! a stable API so the UI (GPUI) never depends on which engine is underneath.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 pub mod blame;
@@ -68,6 +69,87 @@ pub enum MergeOutcome {
     FastForward(String),
     Merged(String),
     Conflicts,
+}
+
+/// Kind of ref pointing at a commit (drives the colored chips in the log).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefKind {
+    Head,
+    LocalBranch,
+    RemoteBranch,
+    Tag,
+}
+
+/// A ref label shown as a chip on a commit row.
+#[derive(Debug, Clone)]
+pub struct RefLabel {
+    pub name: String,
+    pub kind: RefKind,
+}
+
+/// A tag (lightweight or annotated).
+#[derive(Debug, Clone)]
+pub struct TagInfo {
+    pub name: String,
+    /// Commit the tag resolves to.
+    pub target: String,
+    /// Annotation message (empty for lightweight tags).
+    pub message: String,
+}
+
+/// `reset` mode, mirroring git's `--soft/--mixed/--hard`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetMode {
+    Soft,
+    Mixed,
+    Hard,
+}
+
+/// One entry of the reflog (`HEAD@{n}`).
+#[derive(Debug, Clone)]
+pub struct ReflogEntry {
+    pub id: String,
+    pub message: String,
+    pub time: i64,
+}
+
+/// A configured remote (name + fetch URL).
+#[derive(Debug, Clone)]
+pub struct RemoteInfo {
+    pub name: String,
+    pub url: String,
+}
+
+/// A submodule entry.
+#[derive(Debug, Clone)]
+pub struct SubmoduleInfo {
+    pub name: String,
+    pub path: String,
+    /// Short hash the submodule is pinned at (if known).
+    pub head: Option<String>,
+}
+
+/// A stash entry.
+#[derive(Debug, Clone)]
+pub struct StashInfo {
+    pub index: usize,
+    pub message: String,
+    pub id: String,
+}
+
+/// The three sides of a conflicted file, as text (for the 3-way merge viewer).
+#[derive(Debug, Clone, Default)]
+pub struct ConflictSides {
+    pub base: Option<String>,
+    pub ours: Option<String>,
+    pub theirs: Option<String>,
+}
+
+/// How far the current branch is ahead/behind its upstream.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AheadBehind {
+    pub ahead: usize,
+    pub behind: usize,
 }
 
 impl Repo {
@@ -412,6 +494,406 @@ impl Repo {
         }
         Ok(out)
     }
+}
+
+impl Repo {
+    /// Maps each commit id to the refs (branches/tags/HEAD) pointing at it.
+    /// Drives the colored chips drawn on the log rows.
+    pub fn refs_by_commit(&self) -> Result<HashMap<String, Vec<RefLabel>>, Error> {
+        let mut map: HashMap<String, Vec<RefLabel>> = HashMap::new();
+        if let Ok(head) = self.inner.head() {
+            if let Ok(commit) = head.peel_to_commit() {
+                let name = if head.is_branch() {
+                    head.shorthand().unwrap_or("HEAD").to_string()
+                } else {
+                    "HEAD".to_string()
+                };
+                map.entry(commit.id().to_string())
+                    .or_default()
+                    .push(RefLabel { name, kind: RefKind::Head });
+            }
+        }
+        for r in self.inner.references()? {
+            let r = match r {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let kind = if r.is_branch() {
+                RefKind::LocalBranch
+            } else if r.is_remote() {
+                RefKind::RemoteBranch
+            } else if r.is_tag() {
+                RefKind::Tag
+            } else {
+                continue;
+            };
+            let name = r.shorthand().unwrap_or("").to_string();
+            if name.is_empty() || name == "HEAD" {
+                continue;
+            }
+            if let Ok(commit) = r.peel_to_commit() {
+                let entry = map.entry(commit.id().to_string()).or_default();
+                // Don't duplicate the HEAD branch's chip.
+                let dup = kind == RefKind::LocalBranch
+                    && entry.iter().any(|x| x.kind == RefKind::Head && x.name == name);
+                if !dup {
+                    entry.push(RefLabel { name, kind });
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    // ---- Tags ----
+    pub fn tags(&self) -> Result<Vec<TagInfo>, Error> {
+        let mut out = Vec::new();
+        for name in self.inner.tag_names(None)?.iter().flatten() {
+            let full = format!("refs/tags/{name}");
+            if let Ok(reference) = self.inner.find_reference(&full) {
+                let target = reference
+                    .peel_to_commit()
+                    .map(|c| c.id().to_string())
+                    .unwrap_or_default();
+                let message = reference
+                    .peel(git2::ObjectType::Tag)
+                    .ok()
+                    .and_then(|o| o.into_tag().ok())
+                    .and_then(|t| t.message().map(|m| m.trim().to_string()))
+                    .unwrap_or_default();
+                out.push(TagInfo { name: name.to_string(), target, message });
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn create_tag(&self, name: &str, target: &str, message: Option<&str>) -> Result<(), Error> {
+        let obj = self.inner.find_object(git2::Oid::from_str(target)?, None)?;
+        match message {
+            Some(m) if !m.trim().is_empty() => {
+                let sig = self.inner.signature()?;
+                self.inner.tag(name, &obj, &sig, m, false)?;
+            }
+            _ => {
+                self.inner.tag_lightweight(name, &obj, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn delete_tag(&self, name: &str) -> Result<(), Error> {
+        self.inner.tag_delete(name)
+    }
+
+    pub fn push_tag(&self, remote: &str, name: &str) -> Result<String, String> {
+        self.git_cli(&["push", remote, &format!("refs/tags/{name}")])
+    }
+
+    // ---- Reset / undo ----
+    pub fn reset(&self, target: &str, mode: ResetMode) -> Result<(), Error> {
+        let obj = self.inner.find_object(git2::Oid::from_str(target)?, None)?;
+        let kind = match mode {
+            ResetMode::Soft => git2::ResetType::Soft,
+            ResetMode::Mixed => git2::ResetType::Mixed,
+            ResetMode::Hard => git2::ResetType::Hard,
+        };
+        let mut cb = git2::build::CheckoutBuilder::new();
+        let checkout = if matches!(mode, ResetMode::Hard) { Some(&mut cb) } else { None };
+        self.inner.reset(&obj, kind, checkout)
+    }
+
+    /// Undo the last commit, keeping its changes staged (`reset --soft HEAD~1`).
+    pub fn uncommit(&self) -> Result<(), Error> {
+        let head = self.inner.head()?.peel_to_commit()?;
+        let parent = head.parent(0)?;
+        self.inner.reset(parent.as_object(), git2::ResetType::Soft, None)
+    }
+
+    // ---- Branch (advanced) ----
+    pub fn create_branch_at(&self, name: &str, commit_id: &str) -> Result<(), Error> {
+        let commit = self.inner.find_commit(git2::Oid::from_str(commit_id)?)?;
+        self.inner.branch(name, &commit, false)?;
+        Ok(())
+    }
+
+    pub fn rename_branch(&self, old: &str, new: &str) -> Result<(), Error> {
+        let mut b = self.inner.find_branch(old, git2::BranchType::Local)?;
+        b.rename(new, false)?;
+        Ok(())
+    }
+
+    pub fn set_upstream(&self, branch: &str, upstream: Option<&str>) -> Result<(), Error> {
+        let mut b = self.inner.find_branch(branch, git2::BranchType::Local)?;
+        b.set_upstream(upstream)
+    }
+
+    /// Detached checkout of an arbitrary commit/revision.
+    pub fn checkout_commit(&self, id: &str) -> Result<(), Error> {
+        let oid = git2::Oid::from_str(id)?;
+        let obj = self.inner.find_object(oid, None)?;
+        self.inner.checkout_tree(&obj, None)?;
+        self.inner.set_head_detached(oid)?;
+        Ok(())
+    }
+
+    /// Ahead/behind of HEAD vs its configured upstream.
+    pub fn ahead_behind(&self) -> Result<AheadBehind, Error> {
+        let head = self.inner.head()?;
+        let local = head.peel_to_commit()?.id();
+        let branch = self
+            .inner
+            .find_branch(head.shorthand().unwrap_or(""), git2::BranchType::Local)?;
+        let upstream = branch.upstream()?.get().peel_to_commit()?.id();
+        let (ahead, behind) = self.inner.graph_ahead_behind(local, upstream)?;
+        Ok(AheadBehind { ahead, behind })
+    }
+
+    // ---- Reflog ----
+    pub fn reflog(&self, limit: usize) -> Result<Vec<ReflogEntry>, Error> {
+        let reflog = self.inner.reflog("HEAD")?;
+        let mut out = Vec::new();
+        for entry in reflog.iter().take(limit) {
+            out.push(ReflogEntry {
+                id: entry.id_new().to_string(),
+                message: entry.message().unwrap_or("").to_string(),
+                time: entry.committer().when().seconds(),
+            });
+        }
+        Ok(out)
+    }
+
+    // ---- Submodules ----
+    pub fn submodules(&self) -> Result<Vec<SubmoduleInfo>, Error> {
+        let mut out = Vec::new();
+        for sm in self.inner.submodules()? {
+            out.push(SubmoduleInfo {
+                name: sm.name().unwrap_or("").to_string(),
+                path: sm.path().to_string_lossy().into_owned(),
+                head: sm.workdir_id().or_else(|| sm.head_id()).map(|o| o.to_string()),
+            });
+        }
+        Ok(out)
+    }
+
+    // ---- Stash (complete) ----
+    pub fn stash_entries(&mut self) -> Result<Vec<StashInfo>, Error> {
+        let mut out = Vec::new();
+        self.inner.stash_foreach(|idx, msg, oid| {
+            out.push(StashInfo { index: idx, message: msg.to_string(), id: oid.to_string() });
+            true
+        })?;
+        Ok(out)
+    }
+
+    pub fn stash_apply_index(&mut self, index: usize) -> Result<(), Error> {
+        self.inner.stash_apply(index, None)
+    }
+
+    pub fn stash_pop_index(&mut self, index: usize) -> Result<(), Error> {
+        self.inner.stash_pop(index, None)
+    }
+
+    pub fn stash_drop_index(&mut self, index: usize) -> Result<(), Error> {
+        self.inner.stash_drop(index)
+    }
+
+    // ---- Conflicts (3-way) ----
+    /// Reads the three sides of a conflicted file as text.
+    pub fn conflict_sides(&self, path: &str) -> Result<ConflictSides, Error> {
+        let index = self.inner.index()?;
+        let mut sides = ConflictSides::default();
+        let read = |entry: &Option<git2::IndexEntry>| -> Option<String> {
+            let entry = entry.as_ref()?;
+            if String::from_utf8_lossy(&entry.path) != path {
+                return None;
+            }
+            let blob = self.inner.find_blob(entry.id).ok()?;
+            Some(String::from_utf8_lossy(blob.content()).into_owned())
+        };
+        if let Ok(conflicts) = index.conflicts() {
+            for c in conflicts.flatten() {
+                if let Some(s) = read(&c.ancestor) {
+                    sides.base = Some(s);
+                }
+                if let Some(s) = read(&c.our) {
+                    sides.ours = Some(s);
+                }
+                if let Some(s) = read(&c.their) {
+                    sides.theirs = Some(s);
+                }
+            }
+        }
+        Ok(sides)
+    }
+
+    /// Resolves a conflicted file by taking one side, then stages it.
+    pub fn resolve_conflict(&self, path: &str, take_ours: bool) -> Result<String, String> {
+        let side = if take_ours { "--ours" } else { "--theirs" };
+        self.git_cli(&["checkout", side, "--", path])?;
+        self.git_cli(&["add", "--", path])
+    }
+
+    // ---- Remotes (management) ----
+    pub fn remotes_detailed(&self) -> Result<Vec<RemoteInfo>, Error> {
+        let mut out = Vec::new();
+        for name in self.inner.remotes()?.iter().flatten() {
+            let url = self
+                .inner
+                .find_remote(name)
+                .ok()
+                .and_then(|r| r.url().map(str::to_string))
+                .unwrap_or_default();
+            out.push(RemoteInfo { name: name.to_string(), url });
+        }
+        Ok(out)
+    }
+
+    pub fn add_remote(&self, name: &str, url: &str) -> Result<(), Error> {
+        self.inner.remote(name, url)?;
+        Ok(())
+    }
+
+    pub fn remove_remote(&self, name: &str) -> Result<(), Error> {
+        self.inner.remote_delete(name)
+    }
+
+    pub fn rename_remote(&self, old: &str, new: &str) -> Result<(), Error> {
+        self.inner.remote_rename(old, new)?;
+        Ok(())
+    }
+
+    pub fn set_remote_url(&self, name: &str, url: &str) -> Result<(), Error> {
+        self.inner.remote_set_url(name, url)
+    }
+
+    // ---- Remote ops (advanced; via git CLI to reuse the user's credentials) ----
+    pub fn fetch_all(&self, prune: bool) -> Result<String, String> {
+        if prune {
+            self.git_cli(&["fetch", "--all", "--prune", "--tags"])
+        } else {
+            self.git_cli(&["fetch", "--all", "--tags"])
+        }
+    }
+
+    pub fn pull_rebase(&self) -> Result<String, String> {
+        self.git_cli(&["pull", "--rebase"])
+    }
+
+    pub fn pull_merge(&self) -> Result<String, String> {
+        self.git_cli(&["pull", "--no-rebase"])
+    }
+
+    /// Push with options: force-with-lease, set upstream, push tags.
+    pub fn push_opts(
+        &self,
+        remote: &str,
+        branch: &str,
+        force_lease: bool,
+        set_upstream: bool,
+        tags: bool,
+    ) -> Result<String, String> {
+        let mut args: Vec<String> = vec!["push".into()];
+        if force_lease {
+            args.push("--force-with-lease".into());
+        }
+        if set_upstream {
+            args.push("--set-upstream".into());
+        }
+        if tags {
+            args.push("--tags".into());
+        }
+        args.push(remote.to_string());
+        args.push(branch.to_string());
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.git_cli(&refs)
+    }
+
+    // ---- Partial / hunk staging ----
+    /// Applies a single file patch to the index (stage a hunk), or reverses it
+    /// (unstage a hunk).
+    pub fn apply_hunk_to_index(&self, file_patch: &str, reverse: bool) -> Result<(), String> {
+        let mut args = vec!["apply", "--cached", "--whitespace=nowarn"];
+        if reverse {
+            args.push("--reverse");
+        }
+        args.push("-");
+        self.git_cli_stdin(&args, file_patch).map(|_| ())
+    }
+
+    /// Runs `git <args>` feeding `input` on stdin. For patch application.
+    fn git_cli_stdin(&self, args: &[&str], input: &str) -> Result<String, String> {
+        use std::io::Write;
+        let wd = self
+            .inner
+            .workdir()
+            .ok_or_else(|| "repo without working dir".to_string())?;
+        let mut child = std::process::Command::new("git")
+            .arg("-C")
+            .arg(wd)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        child
+            .stdin
+            .as_mut()
+            .ok_or("no stdin")?
+            .write_all(input.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+}
+
+/// `log` via **gitoxide (gix)** from an explicit starting commit (hex id).
+/// Powers the per-branch log filter ("show only this branch").
+pub fn gix_log_from(
+    path: &str,
+    start_id: &str,
+    limit: usize,
+) -> Result<Vec<CommitInfo>, Box<dyn std::error::Error>> {
+    use gix::revision::walk::Sorting;
+    use gix::traverse::commit::simple::CommitTimeOrder;
+
+    let mut repo = gix::open(path)?;
+    repo.object_cache_size(32 * 1024 * 1024);
+    let oid = gix::ObjectId::from_hex(start_id.as_bytes())?;
+    let walk = repo
+        .rev_walk(Some(oid))
+        .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst))
+        .all()?;
+
+    let mut out = Vec::with_capacity(limit.min(1024));
+    for info in walk.take(limit) {
+        let info = info?;
+        let commit = repo.find_object(info.id)?.try_into_commit()?;
+        let author = commit.author()?;
+        let message = commit.message()?;
+        out.push(CommitInfo {
+            id: info.id.to_string(),
+            summary: message.summary().to_string(),
+            author: author.name.to_string(),
+            time: info.commit_time.unwrap_or(0),
+            parents: info.parent_ids.iter().map(|id| id.to_string()).collect(),
+        });
+    }
+    Ok(out)
+}
+
+/// Resolves a ref name (branch/tag/HEAD) to a commit and logs from it.
+pub fn gix_log_ref(
+    path: &str,
+    refname: &str,
+    limit: usize,
+) -> Result<Vec<CommitInfo>, Box<dyn std::error::Error>> {
+    let repo = git2::Repository::open(path)?;
+    let oid = repo.revparse_single(refname)?.peel_to_commit()?.id();
+    gix_log_from(path, &oid.to_string(), limit)
 }
 
 /// `log` via **gitoxide (gix)** — the candidate engine for the hot paths.

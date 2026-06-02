@@ -74,6 +74,11 @@ thread_local! {
 /// Reuses a per-thread cached gix repo: the first diff opens it, the
 /// rest reuse the warm object cache. Fast on huge repos.
 pub fn commit_diff(path: &str, commit_id: &str) -> Result<Vec<FileDiff>, String> {
+    commit_diff_ws(path, commit_id, false)
+}
+
+/// Like [`commit_diff`] but optionally ignoring whitespace.
+pub fn commit_diff_ws(path: &str, commit_id: &str, ignore_ws: bool) -> Result<Vec<FileDiff>, String> {
     DIFF_REPO.with(|cell| {
         let mut slot = cell.borrow_mut();
         let reopen = !matches!(&*slot, Some((p, _)) if p == path);
@@ -82,11 +87,15 @@ pub fn commit_diff(path: &str, commit_id: &str) -> Result<Vec<FileDiff>, String>
             repo.object_cache_size(64 * 1024 * 1024);
             *slot = Some((path.to_string(), repo));
         }
-        commit_diff_in(&slot.as_ref().unwrap().1, commit_id)
+        commit_diff_in(&slot.as_ref().unwrap().1, commit_id, ignore_ws)
     })
 }
 
-fn commit_diff_in(repo: &gix::Repository, commit_id: &str) -> Result<Vec<FileDiff>, String> {
+fn commit_diff_in(
+    repo: &gix::Repository,
+    commit_id: &str,
+    ignore_ws: bool,
+) -> Result<Vec<FileDiff>, String> {
     use gix::object::tree::diff::ChangeDetached as Change;
 
     let oid = gix::ObjectId::from_hex(commit_id.as_bytes()).map_err(|e| e.to_string())?;
@@ -116,6 +125,9 @@ fn commit_diff_in(repo: &gix::Repository, commit_id: &str) -> Result<Vec<FileDif
     let mut files = Vec::with_capacity(changes.len());
     let mut opts = git2::DiffOptions::new();
     opts.context_lines(3);
+    if ignore_ws {
+        opts.ignore_whitespace(true);
+    }
 
     for ch in changes {
         let (path_s, old_path, status, old_id, new_id) = match ch {
@@ -164,9 +176,17 @@ fn commit_diff_in(repo: &gix::Repository, commit_id: &str) -> Result<Vec<FileDif
 /// Diff of working-tree changes: unstaged (index vs WT) if `staged=false`,
 /// or staged (HEAD vs index) if `staged=true`. For the Local Changes view.
 pub fn workdir_diff(path: &str, staged: bool) -> Result<Vec<FileDiff>, String> {
+    workdir_diff_ws(path, staged, false)
+}
+
+/// Like [`workdir_diff`] but optionally ignoring whitespace.
+pub fn workdir_diff_ws(path: &str, staged: bool, ignore_ws: bool) -> Result<Vec<FileDiff>, String> {
     let repo = git2::Repository::open(path).map_err(|e| e.to_string())?;
     let mut opts = git2::DiffOptions::new();
     opts.context_lines(3).include_untracked(true).recurse_untracked_dirs(true);
+    if ignore_ws {
+        opts.ignore_whitespace(true);
+    }
 
     let diff = if staged {
         let head_tree = repo.head().and_then(|h| h.peel_to_tree()).ok();
@@ -243,6 +263,32 @@ fn patch_to_hunks(patch: git2::Patch) -> Result<(Vec<Hunk>, bool), git2::Error> 
         hunks.push(Hunk { header, lines });
     }
     Ok((hunks, false))
+}
+
+/// Reconstructs a `git apply`-able unified patch for a single hunk of a file.
+/// Used to stage/unstage one hunk at a time (partial staging). Best suited to
+/// modified files (new/deleted files are staged whole).
+pub fn build_hunk_patch(file: &FileDiff, hunk_index: usize) -> Option<String> {
+    let hunk = file.hunks.get(hunk_index)?;
+    let path = &file.path;
+    let mut p = String::new();
+    p.push_str(&format!("diff --git a/{path} b/{path}\n"));
+    p.push_str(&format!("--- a/{path}\n"));
+    p.push_str(&format!("+++ b/{path}\n"));
+    // The stored header is the full `@@ -a,b +c,d @@ [section]` line.
+    p.push_str(hunk.header.trim_end());
+    p.push('\n');
+    for l in &hunk.lines {
+        let sign = match l.origin {
+            LineOrigin::Add => '+',
+            LineOrigin::Del => '-',
+            LineOrigin::Context => ' ',
+        };
+        p.push(sign);
+        p.push_str(&l.content);
+        p.push('\n');
+    }
+    Some(p)
 }
 
 /// Translates libgit2's `Delta` to our `FileState`.
