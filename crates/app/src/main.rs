@@ -14,11 +14,95 @@ use git_core::{
 };
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds,
-    ClipboardItem, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton, PathBuilder,
-    PathPromptOptions, Rgba, ScrollStrategy, SharedString, UniformListScrollHandle, Window,
-    WindowBounds, WindowOptions,
+    ClipboardItem, Context, Entity, FocusHandle, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem,
+    MouseButton, OsAction, PathBuilder, PathPromptOptions, Rgba, ScrollStrategy, SharedString,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use std::collections::HashMap;
+
+// Native macOS menu-bar actions. Each maps a system menu item to an app method,
+// so every "option" lives in the menu bar that macOS already provides.
+gpui::actions!(
+    diff,
+    [
+        OpenRepo, CloneRepo, QuitApp, HideApp, AboutApp,
+        Fetch, Pull, Push, FetchPrune, RefreshView,
+        ViewLog, ViewChanges, ViewBranches, ViewStashes, ViewReflog,
+        ViewRemotes, ViewSubmodules, ViewPullRequests, ViewSearch, ViewConsole, ViewSettings,
+        ToggleSideBySide, ToggleSyntax, ToggleIgnoreWs,
+        EditUndo, EditRedo, EditCut, EditCopy, EditPaste, EditSelectAll,
+    ]
+);
+
+/// The native macOS menu bar. Putting every command here makes the app behave
+/// like a first-class native application (this is the "tab que ya te da Mac").
+fn native_menus() -> Vec<Menu> {
+    vec![
+        Menu {
+            name: "diff".into(),
+            items: vec![
+                MenuItem::action("About diff", AboutApp),
+                MenuItem::separator(),
+                MenuItem::action("Settings…", ViewSettings),
+                MenuItem::separator(),
+                MenuItem::action("Hide diff", HideApp),
+                MenuItem::separator(),
+                MenuItem::action("Quit diff", QuitApp),
+            ],
+        },
+        Menu {
+            name: "File".into(),
+            items: vec![
+                MenuItem::action("Open Repository…", OpenRepo),
+                MenuItem::action("Clone from URL…", CloneRepo),
+            ],
+        },
+        Menu {
+            name: "Edit".into(),
+            items: vec![
+                MenuItem::os_action("Undo", EditUndo, OsAction::Undo),
+                MenuItem::os_action("Redo", EditRedo, OsAction::Redo),
+                MenuItem::separator(),
+                MenuItem::os_action("Cut", EditCut, OsAction::Cut),
+                MenuItem::os_action("Copy", EditCopy, OsAction::Copy),
+                MenuItem::os_action("Paste", EditPaste, OsAction::Paste),
+                MenuItem::os_action("Select All", EditSelectAll, OsAction::SelectAll),
+            ],
+        },
+        Menu {
+            name: "View".into(),
+            items: vec![
+                MenuItem::action("History", ViewLog),
+                MenuItem::action("Changes", ViewChanges),
+                MenuItem::action("Branches", ViewBranches),
+                MenuItem::separator(),
+                MenuItem::action("Stashes", ViewStashes),
+                MenuItem::action("Reflog", ViewReflog),
+                MenuItem::action("Remotes", ViewRemotes),
+                MenuItem::action("Submodules", ViewSubmodules),
+                MenuItem::action("Pull Requests", ViewPullRequests),
+                MenuItem::action("Search in Changes", ViewSearch),
+                MenuItem::action("Git Console", ViewConsole),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Side-by-Side Diff", ToggleSideBySide),
+                MenuItem::action("Toggle Syntax Highlighting", ToggleSyntax),
+                MenuItem::action("Toggle Ignore Whitespace", ToggleIgnoreWs),
+                MenuItem::separator(),
+                MenuItem::action("Refresh", RefreshView),
+            ],
+        },
+        Menu {
+            name: "Repository".into(),
+            items: vec![
+                MenuItem::action("Fetch", Fetch),
+                MenuItem::action("Pull", Pull),
+                MenuItem::action("Push", Push),
+                MenuItem::separator(),
+                MenuItem::action("Fetch All & Prune", FetchPrune),
+            ],
+        },
+    ]
+}
 
 const ROW_H: f32 = 24.0;
 const LANE_W: f32 = 14.0;
@@ -4988,7 +5072,8 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1180.0), px(800.0)), cx);
-        cx.open_window(
+        let window = cx
+            .open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
@@ -5077,7 +5162,67 @@ fn main() {
                 })
             },
         )
-        .unwrap();
+            .unwrap();
+
+        // --- Native macOS menu bar + keyboard shortcuts ---
+        cx.bind_keys([
+            KeyBinding::new("cmd-o", OpenRepo, None),
+            KeyBinding::new("cmd-1", ViewLog, None),
+            KeyBinding::new("cmd-2", ViewChanges, None),
+            KeyBinding::new("cmd-3", ViewBranches, None),
+            KeyBinding::new("cmd-r", RefreshView, None),
+            KeyBinding::new("cmd-,", ViewSettings, None),
+            KeyBinding::new("cmd-h", HideApp, None),
+            KeyBinding::new("cmd-q", QuitApp, None),
+            KeyBinding::new("cmd-shift-f", Fetch, None),
+            KeyBinding::new("cmd-shift-l", Pull, None),
+            KeyBinding::new("cmd-shift-p", Push, None),
+        ]);
+        cx.set_menus(native_menus());
+
+        // Quit / Hide act on the app and don't need the view.
+        cx.on_action::<QuitApp>(|_, cx| cx.quit());
+        cx.on_action::<HideApp>(|_, cx| cx.hide());
+
+        // Every other menu command routes through the window's root view.
+        macro_rules! wire {
+            ($action:ty, |$v:ident, $c:ident| $body:block) => {
+                cx.on_action::<$action>(move |_, app| {
+                    let _ = window.update(app, |$v, _window, $c| $body);
+                });
+            };
+        }
+        wire!(OpenRepo, |v, c| { v.open_dialog(c); });
+        wire!(CloneRepo, |v, c| {
+            v.open_prompt("Clone: url [target-dir]", "", PromptKind::Clone, c);
+        });
+        wire!(AboutApp, |v, c| {
+            v.op_msg = Some("diff — a fast, native git client".into());
+            c.notify();
+        });
+        wire!(Fetch, |v, c| { v.run_remote("fetch", c); });
+        wire!(Pull, |v, c| { v.run_remote("pull", c); });
+        wire!(Push, |v, c| { v.run_remote("push", c); });
+        wire!(FetchPrune, |v, c| { v.run_remote("fetchall", c); });
+        wire!(RefreshView, |v, c| {
+            let view = v.view;
+            v.set_view(view, c);
+        });
+        wire!(ViewLog, |v, c| { v.set_view(ViewMode::Log, c); });
+        wire!(ViewChanges, |v, c| { v.set_view(ViewMode::Changes, c); });
+        wire!(ViewBranches, |v, c| { v.set_view(ViewMode::Branches, c); });
+        wire!(ViewStashes, |v, c| { v.set_view(ViewMode::Stashes, c); });
+        wire!(ViewReflog, |v, c| { v.set_view(ViewMode::Reflog, c); });
+        wire!(ViewRemotes, |v, c| { v.set_view(ViewMode::Remotes, c); });
+        wire!(ViewSubmodules, |v, c| { v.set_view(ViewMode::Submodules, c); });
+        wire!(ViewPullRequests, |v, c| { v.set_view(ViewMode::PullRequests, c); });
+        wire!(ViewSearch, |v, c| { v.set_view(ViewMode::Search, c); });
+        wire!(ViewConsole, |v, c| { v.set_view(ViewMode::Console, c); });
+        wire!(ViewSettings, |v, c| { v.set_view(ViewMode::Settings, c); });
+        wire!(ToggleSideBySide, |v, c| { v.toggle_side_by_side(c); });
+        wire!(ToggleSyntax, |v, c| { v.toggle_syntax(c); });
+        wire!(ToggleIgnoreWs, |v, c| { v.toggle_ignore_ws(c); });
+
         cx.activate(true);
     });
 }
