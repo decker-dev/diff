@@ -7,7 +7,10 @@ use git_core::blame::BlameLine;
 use git_core::diff::{FileDiff, LineOrigin};
 use git_core::graph::{compute_graph, RowGraph};
 use git_core::rebase::{RebaseAction, RebaseResult, RebaseStep};
-use git_core::{AheadBehind, BranchInfo, CommitInfo, RefKind, RefLabel, StatusEntry};
+use git_core::{
+    AheadBehind, BranchInfo, CommitInfo, ConflictSides, RefKind, RefLabel, ReflogEntry, RemoteInfo,
+    StashInfo, StatusEntry, SubmoduleInfo, TagInfo,
+};
 use gpui::{
     div, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds, ClipboardItem, Context,
     Entity, FocusHandle, KeyDownEvent, MouseButton, PathPromptOptions, Rgba, ScrollStrategy,
@@ -44,12 +47,19 @@ mod color {
     pub fn tab_active() -> Rgba { rgb(0x1e1f22) }
 }
 
-/// Main app views (tabs).
+/// Main app views (tabs + the "More" menu).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Log,
     Changes,
     Branches,
+    Conflicts,
+    Stashes,
+    Reflog,
+    Remotes,
+    Submodules,
+    Console,
+    Settings,
 }
 
 /// A row of the interactive rebase editor.
@@ -131,7 +141,14 @@ struct BlameView {
 enum DiffRow {
     /// File header (clickable → blame). `String` = path; the rest = label.
     File(String, String),
-    Hunk(String),
+    /// Hunk header. Carries enough context to stage/unstage this hunk alone.
+    Hunk {
+        file: String,
+        index: usize,
+        header: String,
+        /// `true` if this hunk comes from the staged (index) diff.
+        staged: bool,
+    },
     Line(LineOrigin, String),
 }
 
@@ -139,17 +156,95 @@ enum DiffRow {
 fn build_diff_rows(diff: &[FileDiff]) -> Vec<DiffRow> {
     let mut rows = Vec::new();
     for f in diff {
+        push_file_rows(&mut rows, f, false);
+    }
+    rows
+}
+
+/// Appends one file's rows (header, hunks, lines). `staged` flags whether the
+/// hunks come from the index diff (controls the Stage/Unstage hunk action).
+fn push_file_rows(rows: &mut Vec<DiffRow>, f: &FileDiff, staged: bool) {
+    let (add, del) = f.line_stats();
+    let bin = if f.binary { "  [binary]" } else { "" };
+    rows.push(DiffRow::File(
+        f.path.clone(),
+        format!("{}   +{add} −{del}{bin}   ⟶ blame", f.path),
+    ));
+    for (i, h) in f.hunks.iter().enumerate() {
+        rows.push(DiffRow::Hunk {
+            file: f.path.clone(),
+            index: i,
+            header: h.header.clone(),
+            staged,
+        });
+        for l in &h.lines {
+            rows.push(DiffRow::Line(l.origin, l.content.clone()));
+        }
+    }
+}
+
+/// One side of a side-by-side diff row.
+struct SideCell {
+    lineno: Option<u32>,
+    text: String,
+    kind: LineOrigin,
+}
+
+/// A row of the side-by-side diff (file header, hunk header, or a left/right pair).
+enum SideRow {
+    File(String),
+    Hunk(String),
+    Pair(Option<SideCell>, Option<SideCell>),
+}
+
+/// Flushes accumulated deletions/additions as aligned left/right pairs.
+fn flush_side<'a>(
+    rows: &mut Vec<SideRow>,
+    dels: &mut Vec<&'a git_core::diff::DiffLine>,
+    adds: &mut Vec<&'a git_core::diff::DiffLine>,
+) {
+    let n = dels.len().max(adds.len());
+    for i in 0..n {
+        let l = dels.get(i).map(|d| SideCell {
+            lineno: d.old_lineno,
+            text: d.content.clone(),
+            kind: LineOrigin::Del,
+        });
+        let r = adds.get(i).map(|a| SideCell {
+            lineno: a.new_lineno,
+            text: a.content.clone(),
+            kind: LineOrigin::Add,
+        });
+        rows.push(SideRow::Pair(l, r));
+    }
+    dels.clear();
+    adds.clear();
+}
+
+/// Builds side-by-side rows from a structured diff (deletions left, additions right).
+fn build_side_rows(diff: &[FileDiff]) -> Vec<SideRow> {
+    let mut rows = Vec::new();
+    for f in diff {
         let (add, del) = f.line_stats();
-        let bin = if f.binary { "  [binario]" } else { "" };
-        rows.push(DiffRow::File(
-            f.path.clone(),
-            format!("{}   +{add} −{del}{bin}   ⟶ blame", f.path),
-        ));
+        rows.push(SideRow::File(format!("{}   +{add} −{del}", f.path)));
         for h in &f.hunks {
-            rows.push(DiffRow::Hunk(h.header.clone()));
+            rows.push(SideRow::Hunk(h.header.clone()));
+            let mut dels: Vec<&git_core::diff::DiffLine> = Vec::new();
+            let mut adds: Vec<&git_core::diff::DiffLine> = Vec::new();
             for l in &h.lines {
-                rows.push(DiffRow::Line(l.origin, l.content.clone()));
+                match l.origin {
+                    LineOrigin::Context => {
+                        flush_side(&mut rows, &mut dels, &mut adds);
+                        rows.push(SideRow::Pair(
+                            Some(SideCell { lineno: l.old_lineno, text: l.content.clone(), kind: LineOrigin::Context }),
+                            Some(SideCell { lineno: l.new_lineno, text: l.content.clone(), kind: LineOrigin::Context }),
+                        ));
+                    }
+                    LineOrigin::Del => dels.push(l),
+                    LineOrigin::Add => adds.push(l),
+                }
             }
+            flush_side(&mut rows, &mut dels, &mut adds);
         }
     }
     rows
@@ -219,6 +314,34 @@ struct RebasedApp {
     log_filter_focus: FocusHandle,
     /// Commit indices matching `log_filter` (only used when it's non-empty).
     filtered: Vec<usize>,
+
+    // ---- Diff viewer options ----
+    /// Ignore whitespace in diffs.
+    diff_ignore_ws: bool,
+    /// Side-by-side (two columns) vs unified diff.
+    diff_side_by_side: bool,
+    /// Scroll handle for the commit-diff list (prev/next change navigation).
+    diff_scroll: UniformListScrollHandle,
+    /// Row index of the current change (for prev/next navigation).
+    diff_cursor: usize,
+
+    // ---- Secondary views (engine-backed) ----
+    stashes: Vec<StashInfo>,
+    reflog: Vec<ReflogEntry>,
+    remotes: Vec<RemoteInfo>,
+    submodules: Vec<SubmoduleInfo>,
+    tags: Vec<TagInfo>,
+    conflicts: Vec<String>,
+    conflict_file: Option<String>,
+    conflict_sides: Option<ConflictSides>,
+    /// Git console: command input + accumulated output.
+    console_input: String,
+    console_focus: FocusHandle,
+    console_output: String,
+    /// "More" views dropdown open?
+    more_open: bool,
+    /// Add a `Signed-off-by` trailer on commit.
+    sign_off: bool,
 }
 
 impl RebasedApp {
@@ -559,7 +682,7 @@ impl RebasedApp {
         self.selected = Some(ix);
         self.blame = None; // switching commit returns to the diff view
         let id = self.commits[ix].id.clone();
-        match git_core::diff::commit_diff(&self.repo_path, &id) {
+        match git_core::diff::commit_diff_ws(&self.repo_path, &id, self.diff_ignore_ws) {
             Ok(files) => {
                 self.diff_rows = build_diff_rows(&files);
                 self.diff = files;
@@ -621,11 +744,197 @@ impl RebasedApp {
     fn set_view(&mut self, view: ViewMode, cx: &mut Context<Self>) {
         self.view = view;
         self.op_msg = None;
+        self.more_open = false;
         match view {
             ViewMode::Changes => self.refresh_status(cx),
-            ViewMode::Branches => self.refresh_branches(cx),
-            ViewMode::Log => cx.notify(),
+            ViewMode::Branches => {
+                self.refresh_tags();
+                self.refresh_branches(cx);
+            }
+            ViewMode::Conflicts => self.refresh_conflicts(cx),
+            ViewMode::Stashes => self.refresh_stashes(cx),
+            ViewMode::Reflog => self.refresh_reflog(cx),
+            ViewMode::Remotes => self.refresh_remotes(cx),
+            ViewMode::Submodules => self.refresh_submodules(cx),
+            ViewMode::Log | ViewMode::Console | ViewMode::Settings => cx.notify(),
         }
+    }
+
+    fn toggle_more(&mut self, cx: &mut Context<Self>) {
+        self.more_open = !self.more_open;
+        cx.notify();
+    }
+
+    // ---- Secondary views: refresh + actions ----
+    fn refresh_tags(&mut self) {
+        self.tags = git_core::Repo::open(&self.repo_path)
+            .and_then(|r| r.tags())
+            .unwrap_or_default();
+    }
+
+    fn refresh_stashes(&mut self, cx: &mut Context<Self>) {
+        self.stashes = git_core::Repo::open(&self.repo_path)
+            .and_then(|mut r| r.stash_entries())
+            .unwrap_or_default();
+        cx.notify();
+    }
+
+    fn refresh_reflog(&mut self, cx: &mut Context<Self>) {
+        self.reflog = git_core::Repo::open(&self.repo_path)
+            .and_then(|r| r.reflog(200))
+            .unwrap_or_default();
+        cx.notify();
+    }
+
+    fn refresh_remotes(&mut self, cx: &mut Context<Self>) {
+        self.remotes = git_core::Repo::open(&self.repo_path)
+            .and_then(|r| r.remotes_detailed())
+            .unwrap_or_default();
+        cx.notify();
+    }
+
+    fn refresh_submodules(&mut self, cx: &mut Context<Self>) {
+        self.submodules = git_core::Repo::open(&self.repo_path)
+            .and_then(|r| r.submodules())
+            .unwrap_or_default();
+        cx.notify();
+    }
+
+    fn refresh_conflicts(&mut self, cx: &mut Context<Self>) {
+        self.conflicts = git_core::Repo::open(&self.repo_path)
+            .and_then(|r| r.conflicts())
+            .unwrap_or_default();
+        if self.conflict_file.as_ref().is_none_or(|f| !self.conflicts.contains(f)) {
+            self.conflict_file = self.conflicts.first().cloned();
+        }
+        self.load_conflict_sides();
+        cx.notify();
+    }
+
+    fn load_conflict_sides(&mut self) {
+        self.conflict_sides = match &self.conflict_file {
+            Some(f) => git_core::Repo::open(&self.repo_path)
+                .ok()
+                .and_then(|r| r.conflict_sides(f).ok()),
+            None => None,
+        };
+    }
+
+    fn select_conflict(&mut self, file: String, cx: &mut Context<Self>) {
+        self.conflict_file = Some(file);
+        self.load_conflict_sides();
+        cx.notify();
+    }
+
+    fn resolve_conflict(&mut self, take_ours: bool, cx: &mut Context<Self>) {
+        if let Some(f) = self.conflict_file.clone() {
+            let r = git_core::Repo::open(&self.repo_path)
+                .map_err(|e| e.to_string())
+                .and_then(|repo| repo.resolve_conflict(&f, take_ours));
+            self.op_msg = Some(match r {
+                Ok(_) => format!("resolved {f} ({})", if take_ours { "ours" } else { "theirs" }),
+                Err(e) => format!("✗ {e}"),
+            });
+            self.conflict_file = None;
+        }
+        self.refresh_conflicts(cx);
+    }
+
+    // ---- Stash actions ----
+    fn stash_pop_ix(&mut self, i: usize, cx: &mut Context<Self>) {
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|mut repo| repo.stash_pop_index(i))
+            .map(|_| format!("stash pop {i}"));
+        self.note(r);
+        self.reload_log();
+        self.refresh_stashes(cx);
+    }
+
+    fn stash_apply_ix(&mut self, i: usize, cx: &mut Context<Self>) {
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|mut repo| repo.stash_apply_index(i))
+            .map(|_| format!("stash apply {i}"));
+        self.note(r);
+        self.refresh_stashes(cx);
+    }
+
+    fn stash_drop_ix(&mut self, i: usize, cx: &mut Context<Self>) {
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|mut repo| repo.stash_drop_index(i))
+            .map(|_| format!("stash drop {i}"));
+        self.note(r);
+        self.refresh_stashes(cx);
+    }
+
+    // ---- Tag actions ----
+    fn delete_tag(&mut self, name: String, cx: &mut Context<Self>) {
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|repo| repo.delete_tag(&name))
+            .map(|_| format!("deleted tag {name}"));
+        self.note(r);
+        self.refresh_tags();
+        self.reload_log();
+        cx.notify();
+    }
+
+    fn push_tag(&mut self, name: String, cx: &mut Context<Self>) {
+        let r = git_core::Repo::open(&self.repo_path)
+            .map_err(|e| e.to_string())
+            .and_then(|repo| repo.push_tag("origin", &name));
+        self.note(r.map(|_| format!("pushed tag {name}")));
+        cx.notify();
+    }
+
+    // ---- Remote actions ----
+    fn remote_remove(&mut self, name: String, cx: &mut Context<Self>) {
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|repo| repo.remove_remote(&name))
+            .map(|_| format!("removed remote {name}"));
+        self.note(r);
+        self.refresh_remotes(cx);
+    }
+
+    // ---- Git console ----
+    fn run_console(&mut self, cx: &mut Context<Self>) {
+        let cmd = self.console_input.trim().to_string();
+        if cmd.is_empty() {
+            return;
+        }
+        let parts: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+        let args: Vec<&str> = if parts.first().map(String::as_str) == Some("git") {
+            parts[1..].iter().map(String::as_str).collect()
+        } else {
+            parts.iter().map(String::as_str).collect()
+        };
+        let res = git_core::Repo::open(&self.repo_path)
+            .map_err(|e| e.to_string())
+            .and_then(|repo| repo.git(&args));
+        let body = match res {
+            Ok(o) => o,
+            Err(e) => format!("error: {e}"),
+        };
+        self.console_output
+            .push_str(&format!("$ git {}\n{}\n", args.join(" "), body.trim_end()));
+        self.console_input.clear();
+        self.reload_log();
+        cx.notify();
+    }
+
+    fn on_console_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        if ev.keystroke.key == "enter" {
+            self.run_console(cx);
+            return;
+        }
+        edit_key(&mut self.console_input, ev, false);
+        cx.notify();
+    }
+
+    /// Sets `op_msg` from an operation result (no log reload).
+    fn note<E: std::fmt::Display>(&mut self, r: Result<String, E>) {
+        self.op_msg = Some(match r {
+            Ok(m) => format!("✓ {m}"),
+            Err(e) => format!("✗ {e}"),
+        });
     }
 
     // ---- Local Changes (M4) ----
@@ -634,6 +943,7 @@ impl RebasedApp {
     fn refresh_status(&mut self, cx: &mut Context<Self>) {
         let path = self.repo_path.clone();
         let wt_file = self.wt_file.clone();
+        let ignore_ws = self.diff_ignore_ws;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -642,13 +952,20 @@ impl RebasedApp {
                     let status = repo.status().map_err(|e| e.to_string())?;
                     let rows = match &wt_file {
                         Some(f) => {
-                            let un = git_core::diff::workdir_diff(&path, false).unwrap_or_default();
-                            let st = git_core::diff::workdir_diff(&path, true).unwrap_or_default();
-                            un.iter()
-                                .chain(st.iter())
-                                .find(|x| &x.path == f)
-                                .map(|x| build_diff_rows(std::slice::from_ref(x)))
-                                .unwrap_or_default()
+                            // Prefer the unstaged diff; fall back to the staged one.
+                            let un = git_core::diff::workdir_diff_ws(&path, false, ignore_ws)
+                                .unwrap_or_default();
+                            let mut r = Vec::new();
+                            if let Some(fd) = un.iter().find(|x| &x.path == f) {
+                                push_file_rows(&mut r, fd, false);
+                            } else {
+                                let st = git_core::diff::workdir_diff_ws(&path, true, ignore_ws)
+                                    .unwrap_or_default();
+                                if let Some(fd) = st.iter().find(|x| &x.path == f) {
+                                    push_file_rows(&mut r, fd, true);
+                                }
+                            }
+                            r
                         }
                         None => Vec::new(),
                     };
@@ -695,12 +1012,99 @@ impl RebasedApp {
         self.refresh_status(cx);
     }
 
-    fn do_commit(&mut self, amend: bool, cx: &mut Context<Self>) {
-        let msg = self.commit_msg.trim().to_string();
+    /// Stages a single hunk (or unstages it, if `staged`). Builds the exact
+    /// patch from the working-tree diff and applies it to the index.
+    fn stage_hunk(&mut self, file: String, index: usize, staged: bool, cx: &mut Context<Self>) {
+        let diffs = git_core::diff::workdir_diff(&self.repo_path, staged).unwrap_or_default();
+        let patch = diffs
+            .iter()
+            .find(|x| x.path == file)
+            .and_then(|fd| git_core::diff::build_hunk_patch(fd, index));
+        match patch {
+            Some(p) => {
+                let r = git_core::Repo::open(&self.repo_path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|repo| repo.apply_hunk_to_index(&p, staged));
+                self.op_msg = Some(match r {
+                    Ok(()) => format!("{} hunk · {}", if staged { "unstaged" } else { "staged" }, file),
+                    Err(e) => format!("✗ {e}"),
+                });
+            }
+            None => self.op_msg = Some("Could not build the hunk patch".into()),
+        }
+        self.refresh_status(cx);
+    }
+
+    /// Discards a single working-tree hunk (reverse-applies it to the tree).
+    fn revert_hunk(&mut self, file: String, index: usize, cx: &mut Context<Self>) {
+        let diffs = git_core::diff::workdir_diff(&self.repo_path, false).unwrap_or_default();
+        let patch = diffs
+            .iter()
+            .find(|x| x.path == file)
+            .and_then(|fd| git_core::diff::build_hunk_patch(fd, index));
+        match patch {
+            Some(p) => {
+                let r = git_core::Repo::open(&self.repo_path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|repo| repo.apply_hunk_to_worktree(&p, true));
+                self.op_msg = Some(match r {
+                    Ok(()) => format!("reverted hunk · {file}"),
+                    Err(e) => format!("✗ {e}"),
+                });
+            }
+            None => self.op_msg = Some("Could not build the hunk patch".into()),
+        }
+        self.refresh_status(cx);
+    }
+
+    fn toggle_ignore_ws(&mut self, cx: &mut Context<Self>) {
+        self.diff_ignore_ws = !self.diff_ignore_ws;
+        if let Some(ix) = self.selected {
+            self.selected = None;
+            self.select(ix, cx);
+        }
+        if self.view == ViewMode::Changes {
+            self.refresh_status(cx);
+        }
+        cx.notify();
+    }
+
+    fn toggle_side_by_side(&mut self, cx: &mut Context<Self>) {
+        self.diff_side_by_side = !self.diff_side_by_side;
+        cx.notify();
+    }
+
+    /// Scrolls the commit-diff list to the next/previous file or hunk.
+    fn diff_nav(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let is_change =
+            |r: &DiffRow| matches!(r, DiffRow::File(..) | DiffRow::Hunk { .. });
+        let n = self.diff_rows.len();
+        if n == 0 {
+            return;
+        }
+        let next = if forward {
+            (self.diff_cursor + 1..n).find(|&i| is_change(&self.diff_rows[i]))
+        } else {
+            (0..self.diff_cursor).rev().find(|&i| is_change(&self.diff_rows[i]))
+        };
+        if let Some(i) = next {
+            self.diff_cursor = i;
+            self.diff_scroll.scroll_to_item(i, ScrollStrategy::Top);
+            cx.notify();
+        }
+    }
+
+    fn do_commit(&mut self, amend: bool, cx: &mut Context<Self>) -> bool {
+        let mut msg = self.commit_msg.trim().to_string();
         if msg.is_empty() && !amend {
             self.op_msg = Some("Write a commit message".into());
             cx.notify();
-            return;
+            return false;
+        }
+        if self.sign_off {
+            if let Some((n, em)) = git_core::Repo::open(&self.repo_path).ok().and_then(|r| r.user()) {
+                msg.push_str(&format!("\n\nSigned-off-by: {n} <{em}>"));
+            }
         }
         let r = git_core::Repo::open(&self.repo_path).and_then(|repo| {
             if amend {
@@ -709,6 +1113,7 @@ impl RebasedApp {
                 repo.commit(&msg)
             }
         });
+        let ok = r.is_ok();
         match r {
             Ok(id) => {
                 self.op_msg = Some(format!("✓ committed {}", short(&id)));
@@ -717,6 +1122,24 @@ impl RebasedApp {
             }
             Err(e) => self.op_msg = Some(format!("✗ {e}")),
         }
+        self.refresh_status(cx);
+        ok
+    }
+
+    /// Commit, then push if the commit succeeded.
+    fn commit_and_push(&mut self, cx: &mut Context<Self>) {
+        if self.do_commit(false, cx) {
+            self.run_remote("push", cx);
+        }
+    }
+
+    /// Undo the last commit, keeping its changes staged.
+    fn undo_commit(&mut self, cx: &mut Context<Self>) {
+        let r = git_core::Repo::open(&self.repo_path)
+            .and_then(|repo| repo.uncommit())
+            .map(|_| "undid last commit (changes kept staged)".to_string());
+        self.note(r);
+        self.reload_log();
         self.refresh_status(cx);
     }
 
@@ -826,8 +1249,14 @@ impl RebasedApp {
                     let repo = git_core::Repo::open(&path).map_err(|e| e.to_string())?;
                     match op {
                         "fetch" => repo.fetch("origin"),
+                        "fetchall" => repo.fetch_all(true),
                         "pull" => repo.pull(),
+                        "pullrebase" => repo.pull_rebase(),
+                        "pullmerge" => repo.pull_merge(),
                         "push" => repo.push("origin", &branch),
+                        "pushforce" => repo.push_opts("origin", &branch, true, false, false),
+                        "pushupstream" => repo.push_opts("origin", &branch, false, true, false),
+                        "pushtags" => repo.push_opts("origin", &branch, false, false, true),
                         _ => Ok(String::new()),
                     }
                 })
@@ -1061,6 +1490,13 @@ impl Render for RebasedApp {
                 ViewMode::Log => self.render_log(cx),
                 ViewMode::Changes => self.render_changes(cx),
                 ViewMode::Branches => self.render_branches(cx),
+                ViewMode::Conflicts => self.render_conflicts(cx),
+                ViewMode::Stashes => self.render_stashes(cx),
+                ViewMode::Reflog => self.render_reflog(cx),
+                ViewMode::Remotes => self.render_remotes(cx),
+                ViewMode::Submodules => self.render_submodules(cx),
+                ViewMode::Console => self.render_console(cx),
+                ViewMode::Settings => self.render_settings(cx),
             }
         };
         let overlays = self.render_overlays(cx);
@@ -1170,6 +1606,9 @@ impl RebasedApp {
     /// Floating overlays (commit context menu, modal prompt) drawn on top.
     fn render_overlays(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let mut out = Vec::new();
+        if self.more_open {
+            out.push(self.render_more_menu(cx));
+        }
         if let Some(menu) = &self.menu {
             out.push(self.render_commit_menu(menu, cx));
         }
@@ -1432,6 +1871,22 @@ impl RebasedApp {
             .child(tab("Log", ViewMode::Log))
             .child(tab("Changes", ViewMode::Changes))
             .child(tab("Branches", ViewMode::Branches))
+            .child({
+                let secondary = !matches!(view, ViewMode::Log | ViewMode::Changes | ViewMode::Branches);
+                let e2 = e.clone();
+                div()
+                    .id("tab-more")
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_sm()
+                    .bg(if secondary { color::tab_active() } else { color::panel() })
+                    .text_color(if secondary { color::accent() } else { color::dim() })
+                    .hover(|s| s.bg(color::hover()))
+                    .on_click(move |_, _, app| e2.update(app, |t, cx| t.toggle_more(cx)))
+                    .child("More ▾")
+            })
             .child(div().flex_1().min_w_0().text_color(color::dim()).text_sm().px_2().whitespace_nowrap().text_ellipsis().child(head_label))
             .child(btn("tb-fetch", "Fetch", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.run_remote("fetch", cx)); } }))
             .child(btn("tb-pull", "Pull", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.run_remote("pull", cx)); } }))
@@ -1647,8 +2102,15 @@ impl RebasedApp {
                     uniform_list(
                         "wt-rows",
                         n,
-                        cx.processor(|this, range: std::ops::Range<usize>, _w, _c| {
-                            range.filter_map(|i| this.wt_rows.get(i).map(wt_row_el)).collect::<Vec<_>>()
+                        cx.processor({
+                            let entity = e.clone();
+                            move |this, range: std::ops::Range<usize>, _w, _c| {
+                                range
+                                    .filter_map(|i| {
+                                        this.wt_rows.get(i).map(|row| wt_row_el(row, &entity))
+                                    })
+                                    .collect::<Vec<_>>()
+                            }
                         }),
                     )
                     .size_full(),
@@ -1694,8 +2156,11 @@ impl RebasedApp {
                     .flex()
                     .flex_row()
                     .gap_2()
-                    .child(btn("do-commit", "Commit", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.do_commit(false, cx)); } }))
-                    .child(btn("do-amend", "Amend", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.do_commit(true, cx)); } })),
+                    .child(btn("do-commit", "Commit", { let e = e.clone(); move |app| { e.update(app, |t, cx| { t.do_commit(false, cx); }); } }))
+                    .child(btn("do-commit-push", "Commit & Push", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.commit_and_push(cx)); } }))
+                    .child(btn("do-amend", "Amend", { let e = e.clone(); move |app| { e.update(app, |t, cx| { t.do_commit(true, cx); }); } }))
+                    .child(btn("do-undo", "Undo last", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.undo_commit(cx)); } }))
+                    .child(btn("do-signoff", if self.sign_off { "Sign-off ✓" } else { "Sign-off" }, { let e = e.clone(); move |app| { e.update(app, |t, cx| { t.sign_off = !t.sign_off; cx.notify(); }); } })),
             );
 
         div()
@@ -1709,7 +2174,8 @@ impl RebasedApp {
             .into_any_element()
     }
 
-    /// Branches view (M5): list with checkout/merge/delete + create branch.
+    /// Branches view: local branches (with checkout/merge/rename/upstream/delete),
+    /// tags (delete/push) and worktrees, plus a create-branch box.
     fn render_branches(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let e = cx.entity();
         let mut list = div()
@@ -1720,11 +2186,16 @@ impl RebasedApp {
             .min_h_0()
             .overflow_y_scroll();
 
+        list = list.child(section_row("Local branches"));
         for b in &self.branches {
             let name = b.name.clone();
+            let up = b.upstream.clone();
             let (e1, n1) = (e.clone(), name.clone());
             let (e2, n2) = (e.clone(), name.clone());
             let (e3, n3) = (e.clone(), name.clone());
+            let (e4, n4) = (e.clone(), name.clone());
+            let (e5, n5) = (e.clone(), name.clone());
+            let up_for_prompt = up.clone().unwrap_or_default();
             list = list.child(
                 div()
                     .flex()
@@ -1735,7 +2206,7 @@ impl RebasedApp {
                     .px_3()
                     .h(px(30.0))
                     .hover(|s| s.bg(color::hover()))
-                    .child(div().flex_none().w(px(14.0)).text_color(color::accent()).child(if b.is_head { "●" } else { "" }))
+                    .child(div().flex_none().w(px(12.0)).text_color(color::accent()).child(if b.is_head { "●" } else { "" }))
                     .child(
                         div()
                             .flex_1()
@@ -1745,10 +2216,60 @@ impl RebasedApp {
                             .text_color(if b.is_head { color::accent() } else { color::fg() })
                             .child(name.clone()),
                     )
+                    .child(div().flex_none().w(px(140.0)).whitespace_nowrap().text_ellipsis().text_xs().text_color(color::dim()).child(up.unwrap_or_default()))
                     .child(btn(&format!("co-{name}"), "checkout", move |app| { let n = n1.clone(); e1.update(app, |t, cx| t.do_checkout(n, cx)); }))
                     .child(btn(&format!("mg-{name}"), "merge", move |app| { let n = n2.clone(); e2.update(app, |t, cx| t.do_merge(n, cx)); }))
+                    .child(btn(&format!("rn-{name}"), "rename", move |app| { let n = n4.clone(); e4.update(app, |t, cx| t.open_prompt("Rename branch", &n, PromptKind::RenameBranch(n.clone()), cx)); }))
+                    .child(btn(&format!("up-{name}"), "upstream", move |app| { let (n, u) = (n5.clone(), up_for_prompt.clone()); e5.update(app, |t, cx| t.open_prompt("Set upstream (empty to unset)", &u, PromptKind::SetUpstream(n.clone()), cx)); }))
                     .child(btn(&format!("rm-{name}"), "delete", move |app| { let n = n3.clone(); e3.update(app, |t, cx| t.do_delete_branch(n, cx)); })),
             );
+        }
+
+        // Tags
+        list = list.child(section_row("Tags"));
+        if self.tags.is_empty() {
+            list = list.child(div().px_3().py_1().text_xs().text_color(color::dim()).child("No tags"));
+        }
+        for t in &self.tags {
+            let name = t.name.clone();
+            let (e1, n1) = (e.clone(), name.clone());
+            let (e2, n2) = (e.clone(), name.clone());
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .h(px(28.0))
+                    .hover(|s| s.bg(color::hover()))
+                    .child(div().flex_none().text_color(color::tab_active()).text_color(rgb(0xe6c46a)).child("⌗"))
+                    .child(div().flex_1().min_w_0().whitespace_nowrap().text_ellipsis().text_color(color::fg()).child(name.clone()))
+                    .child(div().flex_none().w(px(64.0)).font_family("Menlo").text_xs().text_color(color::dim()).child(short(&t.target)))
+                    .child(btn(&format!("tpush-{name}"), "push", move |app| { let n = n1.clone(); e1.update(app, |t, cx| t.push_tag(n, cx)); }))
+                    .child(btn(&format!("tdel-{name}"), "delete", move |app| { let n = n2.clone(); e2.update(app, |t, cx| t.delete_tag(n, cx)); })),
+            );
+        }
+
+        // Worktrees (read live; cheap)
+        let worktrees = git_core::Repo::open(&self.repo_path)
+            .and_then(|r| r.worktrees())
+            .unwrap_or_default();
+        if !worktrees.is_empty() {
+            list = list.child(section_row("Worktrees"));
+            for w in worktrees {
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .w_full()
+                        .px_3()
+                        .h(px(26.0))
+                        .text_color(color::fg())
+                        .child(w),
+                );
+            }
         }
 
         let create = div()
@@ -1886,6 +2407,410 @@ impl RebasedApp {
     }
 }
 
+impl RebasedApp {
+    /// Conflicts view: file list + 3-way (base/ours/theirs) with resolve actions.
+    fn render_conflicts(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        if self.conflicts.is_empty() {
+            return titled(
+                "Conflicts",
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(color::ok())
+                    .child("No conflicts ✓")
+                    .into_any_element(),
+            );
+        }
+
+        let mut files = div()
+            .id("confl-files")
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(240.0))
+            .border_r_1()
+            .border_color(color::line())
+            .overflow_y_scroll();
+        for f in &self.conflicts {
+            let sel = self.conflict_file.as_deref() == Some(f.as_str());
+            let (e1, f1) = (e.clone(), f.clone());
+            files = files.child(
+                div()
+                    .id(SharedString::from(format!("cf-{f}")))
+                    .w_full()
+                    .px_3()
+                    .h(px(26.0))
+                    .cursor_pointer()
+                    .when(sel, |d| d.bg(color::sel()))
+                    .hover(|s| s.bg(color::hover()))
+                    .text_color(color::err())
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .on_click(move |_, _, app| {
+                        let f = f1.clone();
+                        e1.update(app, |t, cx| t.select_conflict(f, cx));
+                    })
+                    .child(f.clone()),
+            );
+        }
+
+        let side = |title: &str, content: Option<&String>, col: Rgba| -> gpui::AnyElement {
+            let body = content.cloned().unwrap_or_else(|| "(absent)".to_string());
+            let lines: Vec<_> = body
+                .lines()
+                .map(|l| div().whitespace_nowrap().child(l.to_string()))
+                .collect();
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .border_l_1()
+                .border_color(color::line())
+                .child(div().px_2().py_1().bg(color::panel()).text_xs().text_color(col).child(title.to_string()))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("cs-{title}")))
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .font_family("Menlo")
+                        .text_xs()
+                        .p_2()
+                        .flex()
+                        .flex_col()
+                        .children(lines),
+                )
+                .into_any_element()
+        };
+        let s = self.conflict_sides.as_ref();
+        let panel = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .child(side("Base", s.and_then(|x| x.base.as_ref()), color::dim()))
+            .child(side("Ours (HEAD)", s.and_then(|x| x.ours.as_ref()), color::accent()))
+            .child(side("Theirs", s.and_then(|x| x.theirs.as_ref()), rgb(0xc8b8ec)));
+
+        let toolbar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .bg(color::panel())
+            .border_b_1()
+            .border_color(color::line())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_color(color::fg())
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(self.conflict_file.clone().unwrap_or_default()),
+            )
+            .child(btn("c-ours", "Use ours", { let e = e.clone(); move |app| e.update(app, |t, cx| t.resolve_conflict(true, cx)) }))
+            .child(btn("c-theirs", "Use theirs", { let e = e.clone(); move |app| e.update(app, |t, cx| t.resolve_conflict(false, cx)) }));
+
+        let body = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .child(files)
+            .child(div().flex().flex_col().flex_1().min_h_0().child(toolbar).child(panel));
+        titled(&format!("Conflicts ({})", self.conflicts.len()), body.into_any_element())
+    }
+
+    /// Stashes view.
+    fn render_stashes(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        let mut list = div().id("stash-list").flex().flex_col().flex_1().min_h_0().overflow_y_scroll();
+        if self.stashes.is_empty() {
+            list = list.child(div().p_3().text_color(color::dim()).child("No stashes"));
+        }
+        for s in &self.stashes {
+            let i = s.index;
+            let (e1, e2, e3) = (e.clone(), e.clone(), e.clone());
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .h(px(30.0))
+                    .hover(|s| s.bg(color::hover()))
+                    .child(div().flex_none().w(px(70.0)).font_family("Menlo").text_xs().text_color(color::accent()).child(format!("stash@{{{i}}}")))
+                    .child(div().flex_1().min_w_0().whitespace_nowrap().text_ellipsis().text_color(color::fg()).child(s.message.clone()))
+                    .child(btn(&format!("sp-{i}"), "pop", move |app| { e1.update(app, |t, cx| t.stash_pop_ix(i, cx)); }))
+                    .child(btn(&format!("sa-{i}"), "apply", move |app| { e2.update(app, |t, cx| t.stash_apply_ix(i, cx)); }))
+                    .child(btn(&format!("sd-{i}"), "drop", move |app| { e3.update(app, |t, cx| t.stash_drop_ix(i, cx)); })),
+            );
+        }
+        let footer = div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .p_2()
+            .border_t_1()
+            .border_color(color::line())
+            .bg(color::panel())
+            .child(btn("stash-new", "Stash working changes", { let e = e.clone(); move |app| e.update(app, |t, cx| t.do_stash(cx)) }));
+        titled("Stashes", div().flex().flex_col().flex_1().min_h_0().child(list).child(footer).into_any_element())
+    }
+
+    /// Reflog view (HEAD).
+    fn render_reflog(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        let mut list = div().id("reflog-list").flex().flex_col().flex_1().min_h_0().overflow_y_scroll();
+        if self.reflog.is_empty() {
+            list = list.child(div().p_3().text_color(color::dim()).child("Empty reflog"));
+        }
+        for (k, r) in self.reflog.iter().enumerate() {
+            let id = r.id.clone();
+            let e1 = e.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("rl-{k}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .h(px(26.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(color::hover()))
+                    .on_click(move |_, _, app| {
+                        let id = id.clone();
+                        e1.update(app, |t, cx| t.go_to_hash(&id, cx));
+                    })
+                    .child(div().flex_none().w(px(56.0)).font_family("Menlo").text_color(color::accent()).child(short(&r.id)))
+                    .child(div().flex_none().w(px(96.0)).text_xs().text_color(color::dim()).child(format!("HEAD@{{{k}}}")))
+                    .child(div().flex_1().min_w_0().whitespace_nowrap().text_ellipsis().text_color(color::fg()).child(r.message.clone())),
+            );
+        }
+        titled("Reflog (HEAD)", list.into_any_element())
+    }
+
+    /// Remotes view.
+    fn render_remotes(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        let mut list = div().id("remotes-list").flex().flex_col().flex_1().min_h_0().overflow_y_scroll();
+        if self.remotes.is_empty() {
+            list = list.child(div().p_3().text_color(color::dim()).child("No remotes"));
+        }
+        for r in &self.remotes {
+            let name = r.name.clone();
+            let (e1, n1) = (e.clone(), name.clone());
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .h(px(30.0))
+                    .hover(|s| s.bg(color::hover()))
+                    .child(div().flex_none().w(px(120.0)).text_color(color::fg()).whitespace_nowrap().text_ellipsis().child(name.clone()))
+                    .child(div().flex_1().min_w_0().text_color(color::dim()).text_sm().whitespace_nowrap().text_ellipsis().child(r.url.clone()))
+                    .child(btn(&format!("rmv-{name}"), "remove", move |app| { let n = n1.clone(); e1.update(app, |t, cx| t.remote_remove(n, cx)); })),
+            );
+        }
+        let footer = div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .p_2()
+            .border_t_1()
+            .border_color(color::line())
+            .bg(color::panel())
+            .child(btn("add-remote", "Add remote…", { let e = e.clone(); move |app| e.update(app, |t, cx| t.open_prompt("Add remote: name url", "origin ", PromptKind::AddRemote, cx)) }))
+            .child(btn("fetch-all", "Fetch all (prune)", { let e = e.clone(); move |app| e.update(app, |t, cx| t.run_remote("fetchall", cx)) }));
+        titled("Remotes", div().flex().flex_col().flex_1().min_h_0().child(list).child(footer).into_any_element())
+    }
+
+    /// Submodules view.
+    fn render_submodules(&self, _cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut list = div().id("subm-list").flex().flex_col().flex_1().min_h_0().overflow_y_scroll();
+        if self.submodules.is_empty() {
+            list = list.child(div().p_3().text_color(color::dim()).child("No submodules"));
+        }
+        for s in &self.submodules {
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .h(px(28.0))
+                    .child(div().flex_none().w(px(180.0)).text_color(color::fg()).whitespace_nowrap().text_ellipsis().child(s.name.clone()))
+                    .child(div().flex_1().min_w_0().text_color(color::dim()).text_sm().whitespace_nowrap().text_ellipsis().child(s.path.clone()))
+                    .child(div().flex_none().w(px(64.0)).font_family("Menlo").text_xs().text_color(color::accent()).child(s.head.as_deref().map(short).unwrap_or_default())),
+            );
+        }
+        titled("Submodules", list.into_any_element())
+    }
+
+    /// Built-in git console.
+    fn render_console(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let lines: Vec<_> = self
+            .console_output
+            .lines()
+            .map(|l| {
+                let col = if l.starts_with("$ ") {
+                    color::accent()
+                } else if l.starts_with("error:") {
+                    color::err()
+                } else {
+                    color::fg()
+                };
+                div().whitespace_nowrap().text_color(col).child(l.to_string())
+            })
+            .collect();
+        let out = div()
+            .id("console-out")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .font_family("Menlo")
+            .text_xs()
+            .p_2()
+            .flex()
+            .flex_col()
+            .children(lines);
+        let input = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .p_2()
+            .border_t_1()
+            .border_color(color::line())
+            .bg(color::panel())
+            .child(div().flex_none().text_color(color::dim()).child("git"))
+            .child(
+                div()
+                    .id("console-input")
+                    .flex_1()
+                    .h(px(28.0))
+                    .px_2()
+                    .bg(color::bg())
+                    .rounded_md()
+                    .border_1()
+                    .border_color(color::line())
+                    .track_focus(&self.console_focus)
+                    .key_context("console")
+                    .on_key_down(cx.listener(Self::on_console_key))
+                    .on_click(cx.listener(|t, _, w, _| w.focus(&t.console_focus)))
+                    .font_family("Menlo")
+                    .text_sm()
+                    .text_color(if self.console_input.is_empty() { color::dim() } else { color::fg() })
+                    .child(if self.console_input.is_empty() {
+                        "status · log --oneline -5 · diff --stat …".to_string()
+                    } else {
+                        self.console_input.clone()
+                    }),
+            )
+            .child(btn("console-run", "Run", { let e = cx.entity(); move |app| e.update(app, |t, cx| t.run_console(cx)) }));
+        titled("Git console", div().flex().flex_col().flex_1().min_h_0().child(out).child(input).into_any_element())
+    }
+
+    /// Settings / info view.
+    fn render_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        let row = |k: &str, v: String| {
+            div()
+                .flex()
+                .flex_row()
+                .gap_3()
+                .px_3()
+                .py_1()
+                .child(div().flex_none().w(px(150.0)).text_color(color::dim()).child(k.to_string()))
+                .child(div().flex_1().min_w_0().whitespace_nowrap().text_ellipsis().text_color(color::fg()).child(v))
+        };
+        let ab = self
+            .ahead_behind
+            .map(|a| format!("ahead {}, behind {}", a.ahead, a.behind))
+            .unwrap_or_else(|| "—".into());
+        let branch = self.branches.iter().find(|b| b.is_head).map(|b| b.name.clone()).unwrap_or_default();
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .child(row("Repository", self.repo_path.clone()))
+            .child(row("Branch", branch))
+            .child(row("Upstream", ab))
+            .child(row("Recent repos", self.recents.len().to_string()))
+            .child(div().h(px(10.0)))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .px_3()
+                    .child(btn("set-ws", if self.diff_ignore_ws { "Ignore WS: on" } else { "Ignore WS: off" }, { let e = e.clone(); move |app| e.update(app, |t, cx| t.toggle_ignore_ws(cx)) }))
+                    .child(btn("set-sbs", if self.diff_side_by_side { "Side-by-side: on" } else { "Side-by-side: off" }, { let e = e.clone(); move |app| e.update(app, |t, cx| t.toggle_side_by_side(cx)) }))
+                    .child(btn("set-signoff", if self.sign_off { "Sign-off: on" } else { "Sign-off: off" }, { let e = e.clone(); move |app| e.update(app, |t, cx| { t.sign_off = !t.sign_off; cx.notify(); }) })),
+            );
+        titled("Settings", body.into_any_element())
+    }
+
+    /// "More views" dropdown (Conflicts/Stashes/Reflog/Remotes/Submodules/Console/Settings).
+    fn render_more_menu(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        let nav = |key: &'static str, label: &'static str, view: ViewMode| {
+            let e = e.clone();
+            menu_row(key, label, move |app| {
+                e.update(app, |t, cx| t.set_view(view, cx));
+            })
+        };
+        let panel = div()
+            .flex()
+            .flex_col()
+            .w(px(180.0))
+            .bg(color::panel())
+            .border_1()
+            .border_color(color::line())
+            .rounded_md()
+            .py_1()
+            .child(nav("mv-conf", "Conflicts", ViewMode::Conflicts))
+            .child(nav("mv-stash", "Stashes", ViewMode::Stashes))
+            .child(nav("mv-reflog", "Reflog", ViewMode::Reflog))
+            .child(nav("mv-remotes", "Remotes", ViewMode::Remotes))
+            .child(nav("mv-subm", "Submodules", ViewMode::Submodules))
+            .child(nav("mv-console", "Git console", ViewMode::Console))
+            .child(nav("mv-settings", "Settings", ViewMode::Settings));
+        let backdrop = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_mouse_down(MouseButton::Left, { let e = e.clone(); move |_, _, app| e.update(app, |t, cx| t.toggle_more(cx)) });
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(backdrop)
+            .child(gpui::anchored().position(gpui::point(px(330.0), px(40.0))).child(panel))
+            .into_any_element()
+    }
+}
+
 /// Short label for a rebase action.
 fn action_label(a: &RebaseAction) -> &'static str {
     match a {
@@ -1895,6 +2820,40 @@ fn action_label(a: &RebaseAction) -> &'static str {
         RebaseAction::Fixup => "FIXUP",
         RebaseAction::Drop => "DROP",
     }
+}
+
+/// Wraps a view body with a titled header bar.
+fn titled(title: &str, body: gpui::AnyElement) -> gpui::AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .child(
+            div()
+                .w_full()
+                .px_3()
+                .py_1()
+                .bg(color::panel())
+                .border_b_1()
+                .border_color(color::line())
+                .text_color(color::accent())
+                .child(title.to_string()),
+        )
+        .child(body)
+        .into_any_element()
+}
+
+/// A small dim section label inside a list.
+fn section_row(label: &str) -> impl IntoElement {
+    div()
+        .w_full()
+        .px_3()
+        .py_1()
+        .text_xs()
+        .text_color(color::dim())
+        .bg(color::row_line())
+        .child(label.to_string())
 }
 
 /// A full-width left-aligned menu row (context menus).
@@ -1927,8 +2886,8 @@ fn btn(id: &str, label: &str, on: impl Fn(&mut App) + 'static) -> impl IntoEleme
         .child(label.to_string())
 }
 
-/// Working-tree diff row (no blame action).
-fn wt_row_el(row: &DiffRow) -> gpui::AnyElement {
+/// Working-tree diff row, with per-hunk Stage/Unstage/Revert actions.
+fn wt_row_el(row: &DiffRow, entity: &Entity<RebasedApp>) -> gpui::AnyElement {
     match row {
         DiffRow::File(_, label) => div()
             .flex()
@@ -1940,15 +2899,63 @@ fn wt_row_el(row: &DiffRow) -> gpui::AnyElement {
             .text_color(color::fg())
             .child(label.replace("   ⟶ blame", ""))
             .into_any_element(),
-        DiffRow::Hunk(h) => div()
-            .flex()
-            .items_center()
-            .h(px(DIFF_ROW_H))
-            .w_full()
-            .px_3()
-            .text_color(color::dim())
-            .child(h.clone())
-            .into_any_element(),
+        DiffRow::Hunk { file, index, header, staged } => {
+            let staged = *staged;
+            let idx = *index;
+            let chip = |key: String, label: &'static str, fg: Rgba, on: Box<dyn Fn(&mut App)>| {
+                div()
+                    .id(SharedString::from(key))
+                    .px_1()
+                    .rounded_sm()
+                    .bg(color::btn())
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(fg)
+                    .hover(|s| s.bg(color::hover()))
+                    .on_click(move |_, _, app| on(app))
+                    .child(label)
+            };
+            let (e1, f1) = (entity.clone(), file.clone());
+            let mut r = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .h(px(DIFF_ROW_H))
+                .w_full()
+                .px_3()
+                .text_color(color::dim())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(header.clone()),
+                )
+                .child(chip(
+                    format!("sh-{file}-{idx}-{staged}"),
+                    if staged { "− unstage" } else { "+ stage" },
+                    color::fg(),
+                    Box::new(move |app| {
+                        let f = f1.clone();
+                        e1.update(app, |t, cx| t.stage_hunk(f, idx, staged, cx));
+                    }),
+                ));
+            if !staged {
+                let (e2, f2) = (entity.clone(), file.clone());
+                r = r.child(chip(
+                    format!("rh-{file}-{idx}"),
+                    "↶ revert",
+                    color::del_fg(),
+                    Box::new(move |app| {
+                        let f = f2.clone();
+                        e2.update(app, |t, cx| t.revert_hunk(f, idx, cx));
+                    }),
+                ));
+            }
+            r.into_any_element()
+        }
         DiffRow::Line(origin, content) => {
             let (fg, bg, sign) = match origin {
                 LineOrigin::Add => (color::add_fg(), color::add_bg(), "+"),
@@ -2056,6 +3063,22 @@ impl RebasedApp {
                     .text_sm()
                     .child(div().font_family("Menlo").text_color(color::accent()).child(short))
                     .child(div().flex_1().min_w_0().whitespace_nowrap().text_ellipsis().child(c.summary.clone()))
+                    .child(btn("d-sbs", if self.diff_side_by_side { "Unified" } else { "Side-by-side" }, {
+                        let e = cx.entity();
+                        move |app| e.update(app, |t, cx| t.toggle_side_by_side(cx))
+                    }))
+                    .child(btn("d-ws", if self.diff_ignore_ws { "WS: ignored" } else { "Ignore WS" }, {
+                        let e = cx.entity();
+                        move |app| e.update(app, |t, cx| t.toggle_ignore_ws(cx))
+                    }))
+                    .child(btn("d-prev", "↑", {
+                        let e = cx.entity();
+                        move |app| e.update(app, |t, cx| t.diff_nav(false, cx))
+                    }))
+                    .child(btn("d-next", "↓", {
+                        let e = cx.entity();
+                        move |app| e.update(app, |t, cx| t.diff_nav(true, cx))
+                    }))
                     .child(btn("rb-from", "⤵ rebase", {
                         let e = cx.entity();
                         move |app| {
@@ -2077,6 +3100,25 @@ impl RebasedApp {
             div().flex_1().p_3().text_color(color::err()).child(err.clone()).into_any_element()
         } else if self.diff_rows.is_empty() {
             div().flex_1().p_3().text_color(color::dim()).child("No changes in this commit").into_any_element()
+        } else if self.diff_side_by_side {
+            let rows = std::rc::Rc::new(build_side_rows(&self.diff));
+            let n = rows.len();
+            div()
+                .flex_1()
+                .min_h_0()
+                .font_family("Menlo")
+                .text_xs()
+                .child(
+                    uniform_list("side-rows", n, {
+                        let rows = rows.clone();
+                        move |range: std::ops::Range<usize>, _w, _cx| {
+                            range.filter_map(|i| rows.get(i).map(side_row_el)).collect::<Vec<_>>()
+                        }
+                    })
+                    .track_scroll(self.diff_scroll.clone())
+                    .size_full(),
+                )
+                .into_any_element()
         } else {
             let entity = cx.entity();
             let n = self.diff_rows.len();
@@ -2095,6 +3137,7 @@ impl RebasedApp {
                                 .collect::<Vec<_>>()
                         }),
                     )
+                    .track_scroll(self.diff_scroll.clone())
                     .size_full(),
                 )
                 .into_any_element()
@@ -2128,7 +3171,7 @@ fn diff_row_el(row: &DiffRow, entity: &Entity<RebasedApp>) -> gpui::AnyElement {
                 .child(label.clone())
                 .into_any_element()
         }
-        DiffRow::Hunk(header) => div()
+        DiffRow::Hunk { header, .. } => div()
             .flex()
             .items_center()
             .h(px(DIFF_ROW_H))
@@ -2156,6 +3199,72 @@ fn diff_row_el(row: &DiffRow, entity: &Entity<RebasedApp>) -> gpui::AnyElement {
                 .into_any_element()
         }
     }
+}
+
+/// A side-by-side diff row: file header, hunk header, or a left/right pair.
+fn side_row_el(row: &SideRow) -> gpui::AnyElement {
+    match row {
+        SideRow::File(label) => div()
+            .flex()
+            .items_center()
+            .h(px(DIFF_ROW_H))
+            .w_full()
+            .px_3()
+            .bg(color::panel())
+            .text_color(color::fg())
+            .child(label.clone())
+            .into_any_element(),
+        SideRow::Hunk(h) => div()
+            .flex()
+            .items_center()
+            .h(px(DIFF_ROW_H))
+            .w_full()
+            .px_3()
+            .text_color(color::dim())
+            .child(h.clone())
+            .into_any_element(),
+        SideRow::Pair(l, r) => div()
+            .flex()
+            .flex_row()
+            .h(px(DIFF_ROW_H))
+            .w_full()
+            .child(side_cell(l))
+            .child(div().flex_none().w(px(1.0)).h(px(DIFF_ROW_H)).bg(color::line()))
+            .child(side_cell(r))
+            .into_any_element(),
+    }
+}
+
+/// One half of a side-by-side row (empty filler if `None`).
+fn side_cell(cell: &Option<SideCell>) -> gpui::AnyElement {
+    let Some(c) = cell else {
+        return div().flex_1().min_w_0().h(px(DIFF_ROW_H)).bg(color::bg()).into_any_element();
+    };
+    let (fg, bg) = match c.kind {
+        LineOrigin::Add => (color::add_fg(), color::add_bg()),
+        LineOrigin::Del => (color::del_fg(), color::del_bg()),
+        LineOrigin::Context => (color::fg(), color::bg()),
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_1()
+        .min_w_0()
+        .h(px(DIFF_ROW_H))
+        .px_2()
+        .gap_2()
+        .bg(bg)
+        .text_color(fg)
+        .child(
+            div()
+                .flex_none()
+                .w(px(38.0))
+                .text_color(color::dim())
+                .child(c.lineno.map(|n| n.to_string()).unwrap_or_default()),
+        )
+        .child(div().flex_1().min_w_0().whitespace_nowrap().child(c.text.clone()))
+        .into_any_element()
 }
 
 /// A virtualized blame row: line · commit · author · text.
@@ -2370,6 +3479,23 @@ fn main() {
                         log_filter: String::new(),
                         log_filter_focus: cx.focus_handle(),
                         filtered: Vec::new(),
+                        diff_ignore_ws: false,
+                        diff_side_by_side: false,
+                        diff_scroll: UniformListScrollHandle::new(),
+                        diff_cursor: 0,
+                        stashes: Vec::new(),
+                        reflog: Vec::new(),
+                        remotes: Vec::new(),
+                        submodules: Vec::new(),
+                        tags: Vec::new(),
+                        conflicts: Vec::new(),
+                        conflict_file: None,
+                        conflict_sides: None,
+                        console_input: String::new(),
+                        console_focus: cx.focus_handle(),
+                        console_output: String::new(),
+                        more_open: false,
+                        sign_off: false,
                     };
                     if let Some(p) = initial {
                         app.load_repo(&p);
