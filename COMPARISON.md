@@ -1,62 +1,61 @@
-# rebased-rs vs Rebased (original, sobre IntelliJ/JVM)
+# rebased-rs vs Rebased (original, on IntelliJ/JVM)
 
-Comparación honesta contra el objetivo: **≥10x más ligero y rápido**.
+An honest comparison against the goal: **≥10x lighter and faster**.
 
-## Qué pude medir directamente y qué no
+## What was measured directly, and what wasn't
 
-- **rebased-rs**: medido en esta máquina (macOS arm64), build release, repo de
-  prueba de 505.988 commits (`../rebased`).
-- **Rebased original**: NO está instalado y construirlo es un build JVM/Bazel
-  enorme, así que sus números son los **típicos/documentados de apps basadas en
-  IntelliJ** (el propio Rebased es "un IDE JetBrains con solo el plugin de git").
-  Donde uso esas cifras, lo marco como *(típico JVM/IntelliJ)*.
-- Como piso de velocidad por operación uso el **`git` CLI** (medido aquí), que es
-  lo más rápido disponible y referencia universal.
+- **rebased-rs**: measured on this machine (macOS arm64), release build, on the
+  505,988-commit test repo (`../rebased`).
+- **Original Rebased**: NOT installed, and building it is a huge JVM/Bazel build,
+  so its numbers are the **typical/documented figures for IntelliJ-based apps**
+  (Rebased itself is "a JetBrains IDE with only the git plugin"). Where those
+  figures are used they are marked *(typical JVM/IntelliJ)*.
+- The **`git` CLI** (measured here) is used as the per-operation speed floor — the
+  fastest available reference.
 
-## Tamaño y peso
+## Size and weight
 
-| Métrica | rebased-rs | Rebased (típico JVM/IntelliJ) | Factor |
+| Metric | rebased-rs | Rebased (typical JVM/IntelliJ) | Factor |
 |---|---|---|---|
-| **Binario / distribución** | **7,8 MB** | 300 MB – 1 GB+ (incluye JBR/JVM) | **~40–130x más ligero** ✅ |
-| **RAM** (50k commits + diff) | **~225 MB** | ~1–2 GB | **~5–9x más ligero** ✅ |
-| **RAM** (ventana recién abierta) | ~85 MB | ~1 GB | **~12x** ✅ |
-| **Arranque** | nativo, ~instantáneo | segundos (arranque JVM + plataforma) *(típico)* | **~10x+** ✅ |
-| **CPU en idle** | 0,0 % | la JVM hace GC/indexado de fondo *(típico)* | ✅ |
+| **Binary / distribution** | **7.8 MB** | 300 MB – 1 GB+ (bundles JBR/JVM) | **~40–130x lighter** ✅ |
+| **RAM** (50k commits + diff) | **~225 MB** | ~1–2 GB | **~5–9x lighter** ✅ |
+| **RAM** (freshly opened window) | ~85 MB | ~1 GB | **~12x** ✅ |
+| **Startup** | native, ~instant | seconds (JVM + platform startup) *(typical)* | **~10x+** ✅ |
+| **Idle CPU** | 0.0 % | JVM does background GC/indexing *(typical)* | ✅ |
 
-## Velocidad por operación (medido vs `git` CLI)
+## Per-operation speed (measured vs `git` CLI)
 
-| Operación (repo 505k commits) | rebased-rs | git CLI | Veredicto |
+| Operation (505k-commit repo) | rebased-rs | git CLI | Verdict |
 |---|---|---|---|
-| log 1.000 commits | 35 ms | 36 ms | igual |
-| log 50.000 commits | 245 ms | 379 ms | **1,5x más rápido que git** |
-| diff de un commit (caliente) | **2 ms** | ~20 ms (paga arranque de proceso) | **~10x** |
-| diff de un commit (frío) | 90 ms | 20 ms | 3x más lento (1ª vez; luego cacheado) |
-| blame de un archivo | 0,73 s | 0,94 s | **1,2x más rápido que git** |
+| log 1,000 commits | 35 ms | 36 ms | tied |
+| log 50,000 commits | 245 ms | 379 ms | **1.5x faster than git** |
+| commit diff (warm) | **2 ms** | ~20 ms (pays process startup) | **~10x** |
+| commit diff (cold) | 90 ms | 20 ms | 3x slower (first time; cached after) |
+| file blame | 0.73 s | 0.94 s | **1.2x faster than git** |
 
-**Clave:** mantenemos el repo gix abierto y caliente *in-process*, así que las
-operaciones repetidas son más rápidas que el `git` CLI (que arranca un proceso
-cada vez) y mucho más que la app JVM (que además suma su propia capa). Rebased
-(IntelliJ) tiene que pasar por JGit/subprocesos + el modelo de la plataforma;
-nosotros vamos directo al ODB de gitoxide.
+**Key:** we keep the gix repo open and warm *in-process*, so repeated operations
+are faster than the `git` CLI (which spawns a process each time) and much faster
+than the JVM app (which also adds its own layer). Rebased (IntelliJ) goes through
+JGit/subprocesses + the platform model; we go straight to the gitoxide ODB.
 
-## Lección de rendimiento aprendida
+## Performance lesson learned
 
-Rust NO es rápido por sí solo: con libgit2 éramos 18–150x **más lentos** que git.
-El rendimiento viene de (1) el motor correcto (**gitoxide** lee el commit-graph y
-tiene un ODB rápido), (2) **estado caliente in-process**, y (3) compilar en
-**release** (en debug, blame era ~65x más lento: 47 s vs 0,7 s).
+Rust is NOT fast by itself: with libgit2 we were 18–150x **slower** than git.
+Performance comes from (1) the right engine (**gitoxide** reads the commit-graph and
+has a fast ODB), (2) **warm in-process state**, and (3) compiling in **release** (in
+debug, blame was ~65x slower: 47 s vs 0.7 s).
 
-## Cómo verificarlo uno mismo
+## Verify it yourself
 
 ```
-cargo run -p app --example selftest --release -- /ruta/al/repo   # motor vs git
-./run.sh /ruta/al/repo                                           # la app (release)
+cargo run -p app --example selftest --release -- /path/to/repo   # engine vs git
+./run.sh /path/to/repo                                           # the app (release)
 ```
 
-## Veredicto del gate (10x)
+## Gate verdict (10x)
 
-- **Ligero**: ✅ holgado — binario ~40–130x, RAM ~5–12x, arranque ~10x+.
-- **Rápido por operación**: ✅ igualamos o superamos al `git` CLI (que ya es el
-  techo), e in-process superamos por mucho a una app JVM.
-- Pendiente para cerrar del todo: medir contra una instancia real de Rebased
-  (requiere construir/instalar la app JVM).
+- **Lighter**: ✅ comfortably — binary ~40–130x, RAM ~5–12x, startup ~10x+.
+- **Faster per operation**: ✅ we match or beat the `git` CLI (already the ceiling),
+  and in-process we far exceed a JVM app.
+- To fully close it: measure against a live instance of Rebased (requires
+  building/installing the JVM app).
