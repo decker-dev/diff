@@ -104,6 +104,188 @@ fn main() {
         Ok(msg) => println!("  ✓ {msg}"),
         Err(e) => println!("  ✗ FAILED: {e}"),
     }
+
+    println!("\n  -- PARITY: hunk staging / reset / tags / reflog / conflicts 3-way --");
+    let parity: [(&str, Result<String, String>); 5] = [
+        ("hunk staging", test_hunk_staging()),
+        ("reset soft/hard", test_reset()),
+        ("tags", test_tags()),
+        ("reflog", test_reflog()),
+        ("conflicts 3-way", test_conflicts()),
+    ];
+    for (name, r) in parity {
+        match r {
+            Ok(msg) => println!("  ✓ {name}: {msg}"),
+            Err(e) => println!("  ✗ {name} FAILED: {e}"),
+        }
+    }
+}
+
+/// Fresh temp repo with git identity configured.
+fn fresh_repo(name: &str) -> Result<(git_core::Repo, std::path::PathBuf, String), String> {
+    let dir = std::env::temp_dir().join(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.to_string_lossy().to_string();
+    let git = |args: &[&str]| {
+        Command::new("git").arg("-C").arg(&path).args(args).output().ok();
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@rebased.rs"]);
+    git(&["config", "user.name", "t"]);
+    let repo = git_core::Repo::open(&path).map_err(es)?;
+    Ok((repo, dir, path))
+}
+
+/// Partial staging: stage exactly one of two hunks via build_hunk_patch + apply.
+fn test_hunk_staging() -> Result<String, String> {
+    let (repo, dir, path) = fresh_repo("diff-hunk")?;
+    let base: String = (1..=20).map(|i| format!("line{i}\n")).collect();
+    fs::write(dir.join("f.txt"), &base).map_err(|e| e.to_string())?;
+    repo.stage("f.txt").map_err(es)?;
+    repo.commit("base").map_err(es)?;
+
+    // Two separated edits → two distinct hunks.
+    let edited = base
+        .replace("line2\n", "line2-edit\n")
+        .replace("line18\n", "line18-edit\n");
+    fs::write(dir.join("f.txt"), &edited).map_err(|e| e.to_string())?;
+
+    let before = git_core::diff::workdir_diff(&path, false)?;
+    let fd = before.iter().find(|f| f.path == "f.txt").ok_or("f.txt not in diff")?;
+    if fd.hunks.len() < 2 {
+        return Err(format!("expected 2 hunks, got {}", fd.hunks.len()));
+    }
+    let patch = git_core::diff::build_hunk_patch(fd, 0).ok_or("could not build hunk patch")?;
+    repo.apply_hunk_to_index(&patch, false)?;
+
+    let staged = git_core::diff::workdir_diff(&path, true)?;
+    let unstaged = git_core::diff::workdir_diff(&path, false)?;
+    let sh = staged.iter().find(|f| f.path == "f.txt").map_or(0, |f| f.hunks.len());
+    let uh = unstaged.iter().find(|f| f.path == "f.txt").map_or(0, |f| f.hunks.len());
+    if sh < 1 || uh < 1 {
+        return Err(format!("partial stage failed (staged hunks={sh}, unstaged hunks={uh})"));
+    }
+    Ok(format!("staged 1 of 2 hunks (staged={sh}, remaining unstaged={uh})"))
+}
+
+/// reset --soft keeps changes staged; reset --hard discards them.
+fn test_reset() -> Result<String, String> {
+    let (repo, dir, path) = fresh_repo("diff-reset")?;
+    fs::write(dir.join("a.txt"), "a\n").map_err(|e| e.to_string())?;
+    repo.stage("a.txt").map_err(es)?;
+    repo.commit("A").map_err(es)?;
+    let a = git_core::gix_log(&path, 1).map_err(|e| e.to_string())?[0].id.clone();
+    fs::write(dir.join("b.txt"), "b\n").map_err(|e| e.to_string())?;
+    repo.stage("b.txt").map_err(es)?;
+    repo.commit("B").map_err(es)?;
+
+    repo.reset(&a, git_core::ResetMode::Soft).map_err(es)?;
+    let log = git_core::gix_log(&path, 10).map_err(|e| e.to_string())?;
+    if log.len() != 1 {
+        return Err(format!("soft: expected 1 commit reachable, got {}", log.len()));
+    }
+    let st = repo.status().map_err(es)?;
+    if !st.iter().any(|e| e.path == "b.txt" && e.staged) {
+        return Err("soft: b.txt should remain staged".into());
+    }
+    repo.reset(&a, git_core::ResetMode::Hard).map_err(es)?;
+    if dir.join("b.txt").exists() {
+        return Err("hard: b.txt should be gone".into());
+    }
+    Ok("soft keeps staged, hard discards".into())
+}
+
+/// Tags: lightweight + annotated, chips via refs_by_commit, delete.
+fn test_tags() -> Result<String, String> {
+    let (repo, dir, path) = fresh_repo("diff-tags")?;
+    fs::write(dir.join("a.txt"), "a\n").map_err(|e| e.to_string())?;
+    repo.stage("a.txt").map_err(es)?;
+    repo.commit("A").map_err(es)?;
+    let a = git_core::gix_log(&path, 1).map_err(|e| e.to_string())?[0].id.clone();
+    repo.create_tag("v1", &a, None).map_err(es)?;
+    repo.create_tag("v2", &a, Some("annotated")).map_err(es)?;
+    let tags = repo.tags().map_err(es)?;
+    if !tags.iter().any(|t| t.name == "v1") || !tags.iter().any(|t| t.name == "v2" && t.message == "annotated") {
+        return Err(format!("tags missing/wrong: {:?}", tags.iter().map(|t| t.name.clone()).collect::<Vec<_>>()));
+    }
+    let refs = repo.refs_by_commit().map_err(es)?;
+    let has_tag = refs.get(&a).is_some_and(|v| v.iter().any(|r| matches!(r.kind, git_core::RefKind::Tag)));
+    if !has_tag {
+        return Err("refs_by_commit missing tag chip".into());
+    }
+    repo.delete_tag("v1").map_err(es)?;
+    if repo.tags().map_err(es)?.iter().any(|t| t.name == "v1") {
+        return Err("v1 not deleted".into());
+    }
+    Ok("lightweight + annotated + chip + delete OK".into())
+}
+
+/// Reflog: non-empty, newest entry is HEAD.
+fn test_reflog() -> Result<String, String> {
+    let (repo, dir, path) = fresh_repo("diff-reflog")?;
+    for f in ["a", "b", "c"] {
+        fs::write(dir.join(format!("{f}.txt")), format!("{f}\n")).map_err(|e| e.to_string())?;
+        repo.stage(&format!("{f}.txt")).map_err(es)?;
+        repo.commit(&format!("commit {f}")).map_err(es)?;
+    }
+    let rl = repo.reflog(10).map_err(es)?;
+    if rl.is_empty() {
+        return Err("reflog empty".into());
+    }
+    let head = git_core::gix_log(&path, 1).map_err(|e| e.to_string())?[0].id.clone();
+    if rl[0].id != head {
+        return Err(format!("reflog[0]={} but HEAD={}", &rl[0].id[..7], &head[..7]));
+    }
+    Ok(format!("{} entries, newest == HEAD", rl.len()))
+}
+
+/// 3-way conflict: produce one, read base/ours/theirs, resolve with ours.
+fn test_conflicts() -> Result<String, String> {
+    let (repo, dir, path) = fresh_repo("diff-confl")?;
+    fs::write(dir.join("f.txt"), "base\n").map_err(|e| e.to_string())?;
+    repo.stage("f.txt").map_err(es)?;
+    repo.commit("base").map_err(es)?;
+    let default = repo
+        .branches()
+        .map_err(es)?
+        .into_iter()
+        .find(|b| b.is_head)
+        .map(|b| b.name)
+        .ok_or("no HEAD branch")?;
+
+    repo.create_branch("feat").map_err(es)?;
+    repo.checkout_branch("feat").map_err(es)?;
+    fs::write(dir.join("f.txt"), "theirs\n").map_err(|e| e.to_string())?;
+    repo.stage("f.txt").map_err(es)?;
+    repo.commit("feat change").map_err(es)?;
+
+    repo.checkout_branch(&default).map_err(es)?;
+    fs::write(dir.join("f.txt"), "ours\n").map_err(|e| e.to_string())?;
+    repo.stage("f.txt").map_err(es)?;
+    repo.commit("main change").map_err(es)?;
+
+    let outcome = repo.merge_branch("feat").map_err(es)?;
+    if outcome != git_core::MergeOutcome::Conflicts {
+        return Err(format!("expected Conflicts, got {outcome:?}"));
+    }
+    let confl = repo.conflicts().map_err(es)?;
+    if !confl.iter().any(|f| f == "f.txt") {
+        return Err(format!("conflicts={confl:?}"));
+    }
+    let sides = repo.conflict_sides("f.txt").map_err(es)?;
+    if sides.ours.as_deref() != Some("ours\n") || sides.theirs.as_deref() != Some("theirs\n") {
+        return Err(format!("sides ours={:?} theirs={:?}", sides.ours, sides.theirs));
+    }
+    repo.resolve_conflict("f.txt", true)?;
+    // The app re-opens the repo on every refresh; do the same so the git2
+    // in-memory index isn't stale after the CLI add.
+    let repo2 = git_core::Repo::open(&path).map_err(es)?;
+    let after = repo2.conflicts().map_err(es)?;
+    if !after.is_empty() {
+        return Err(format!("after resolve, still conflicted: {after:?}"));
+    }
+    Ok("conflict → 3 sides (ours/theirs read) → resolve ours OK".into())
 }
 
 /// Checks stash (save→reverts, list, pop→reapplies) and ignore.
