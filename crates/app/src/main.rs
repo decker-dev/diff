@@ -2435,7 +2435,15 @@ impl Render for RebasedApp {
             .text_color(color::fg())
             .child(toolbar)
             .children(banner)
-            .child(body)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_sidebar(cx))
+                    .child(div().flex_1().min_w_0().flex().flex_col().child(body)),
+            )
             .children(toast)
             .children(overlays)
     }
@@ -2760,28 +2768,6 @@ impl RebasedApp {
     /// Top bar: tabs (Log/Changes/Branches) + network/stash actions.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let e = cx.entity();
-        let view = self.view;
-        let tab = {
-            let e = e.clone();
-            move |label: &str, mode: ViewMode| {
-                let e = e.clone();
-                let active = view == mode;
-                div()
-                    .id(SharedString::from(format!("tab-{label}")))
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_sm()
-                    .bg(if active { color::tab_active() } else { color::panel() })
-                    .text_color(if active { color::accent() } else { color::dim() })
-                    .hover(|s| s.bg(color::hover()))
-                    .on_click(move |_, _, app| {
-                        e.update(app, |t, cx| t.set_view(mode, cx));
-                    })
-                    .child(label.to_string())
-            }
-        };
         let cur = self
             .branches
             .iter()
@@ -2836,30 +2822,81 @@ impl RebasedApp {
                     .text_color(color::accent())
                     .child(self.repo_name.clone()),
             )
-            .child(tab("Log", ViewMode::Log))
-            .child(tab("Changes", ViewMode::Changes))
-            .child(tab("Branches", ViewMode::Branches))
-            .child({
-                let secondary = !matches!(view, ViewMode::Log | ViewMode::Changes | ViewMode::Branches);
-                let e2 = e.clone();
-                div()
-                    .id("tab-more")
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_sm()
-                    .bg(if secondary { color::tab_active() } else { color::panel() })
-                    .text_color(if secondary { color::accent() } else { color::dim() })
-                    .hover(|s| s.bg(color::hover()))
-                    .on_click(move |_, _, app| e2.update(app, |t, cx| t.toggle_more(cx)))
-                    .child("More ▾")
-            })
             .child(div().flex_1().min_w_0().text_color(color::dim()).text_sm().px_2().whitespace_nowrap().text_ellipsis().child(head_label))
             .child(btn("tb-fetch", "Fetch", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.run_remote("fetch", cx)); } }))
             .child(btn("tb-pull", "Pull", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.run_remote("pull", cx)); } }))
             .child(btn("tb-push", "Push", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.run_remote("push", cx)); } }))
             .child(btn("tb-stash", "Stash", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.do_stash(cx)); } }))
+            .into_any_element()
+    }
+
+    /// Persistent left navigation: visible in-app nav for every view (mirrors the
+    /// native View menu). This is the structural "nav" the app was missing.
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        let view = self.view;
+        let item = |e: &Entity<Self>, label: &'static str, mode: ViewMode| {
+            let e = e.clone();
+            let active = view == mode;
+            div()
+                .id(SharedString::from(format!("nav-{label}")))
+                .w_full()
+                .h(px(28.0))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .rounded_md()
+                .cursor_pointer()
+                .text_sm()
+                .text_color(if active { color::fg() } else { color::dim() })
+                .when(active, |s| s.bg(color::sel()))
+                .when(!active, |s| s.hover(|s| s.bg(color::hover())))
+                .on_click(move |_, _, app| {
+                    e.update(app, |t, cx| t.set_view(mode, cx));
+                })
+                .child(label)
+        };
+        let header = |label: &'static str| {
+            div()
+                .w_full()
+                .px_3()
+                .pt_3()
+                .pb_1()
+                .text_xs()
+                .text_color(color::dim())
+                .child(label)
+        };
+
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .w(px(190.0))
+            .h_full()
+            .flex_none()
+            .bg(color::panel())
+            .border_r_1()
+            .border_color(color::line())
+            .px_2()
+            .pb_2()
+            .child(header("WORKSPACE"))
+            .child(item(&e, "Changes", ViewMode::Changes))
+            .child(item(&e, "History", ViewMode::Log))
+            .child(item(&e, "Branches", ViewMode::Branches));
+        if !self.conflicts.is_empty() {
+            col = col.child(item(&e, "Conflicts", ViewMode::Conflicts));
+        }
+        col.child(header("REMOTE"))
+            .child(item(&e, "Remotes", ViewMode::Remotes))
+            .child(item(&e, "Pull Requests", ViewMode::PullRequests))
+            .child(header("LOCAL"))
+            .child(item(&e, "Stashes", ViewMode::Stashes))
+            .child(item(&e, "Reflog", ViewMode::Reflog))
+            .child(item(&e, "Submodules", ViewMode::Submodules))
+            .child(item(&e, "Search", ViewMode::Search))
+            .child(div().flex_1())
+            .child(item(&e, "Git Console", ViewMode::Console))
+            .child(item(&e, "Settings", ViewMode::Settings))
             .into_any_element()
     }
 
