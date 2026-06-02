@@ -4962,7 +4962,26 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// When launched from Finder as a `.app`, the process inherits a minimal PATH
+/// (typically just `/usr/bin:/bin:/usr/sbin:/sbin`), so Homebrew tools like `gh`
+/// — and sometimes `git` — are not found. Prepend the common tool directories so
+/// the CLI integrations work the same whether launched from a terminal or Finder.
+fn ensure_tool_path() {
+    let current = std::env::var("PATH").unwrap_or_default();
+    let mut parts: Vec<String> = ["/opt/homebrew/bin", "/usr/local/bin"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for p in current.split(':').filter(|p| !p.is_empty()) {
+        if !parts.iter().any(|x| x == p) {
+            parts.push(p.to_string());
+        }
+    }
+    std::env::set_var("PATH", parts.join(":"));
+}
+
 fn main() {
+    ensure_tool_path();
     // Optional repo path argument; otherwise the welcome screen shows.
     let initial = std::env::args().nth(1);
     let recents = load_recents();

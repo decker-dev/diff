@@ -1,0 +1,44 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="120" y1="80" x2="900" y2="980" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2a2e40"/>
+      <stop offset="0.55" stop-color="#1b1e2b"/>
+      <stop offset="1" stop-color="#121420"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="300" y1="280" x2="740" y2="720" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5aa9f0"/>
+      <stop offset="1" stop-color="#9b86d6"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.6">
+      <stop offset="0" stop-color="#5aa9f0" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#5aa9f0" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sheen" x1="0" y1="40" x2="0" y2="520" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- squircle background -->
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="url(#bg)"/>
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="url(#sheen)"/>
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="url(#glow)"/>
+  <rect x="65.5" y="65.5" width="893" height="893" rx="206.5" stroke="#ffffff" stroke-opacity="0.07" stroke-width="3"/>
+
+  <!-- commit-graph delta: three nodes forming a Δ (difference) -->
+  <g stroke="url(#accent)" stroke-width="52" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M512 322 L330 690"/>
+    <path d="M512 322 L694 690"/>
+    <path d="M330 690 L694 690"/>
+  </g>
+
+  <!-- nodes (donuts) -->
+  <g>
+    <circle cx="512" cy="322" r="70" fill="url(#accent)"/>
+    <circle cx="512" cy="322" r="30" fill="#171a26"/>
+    <circle cx="330" cy="690" r="70" fill="url(#accent)"/>
+    <circle cx="330" cy="690" r="30" fill="#171a26"/>
+    <circle cx="694" cy="690" r="70" fill="url(#accent)"/>
+    <circle cx="694" cy="690" r="30" fill="#171a26"/>
+  </g>
+</svg>
