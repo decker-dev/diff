@@ -12,6 +12,7 @@ pub mod blame;
 pub mod diff;
 pub mod graph;
 pub mod rebase;
+pub mod syntax;
 
 pub use git2::Error;
 
@@ -908,6 +909,75 @@ impl Repo {
             Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
         }
     }
+}
+
+/// Runs `git -C <repo_dir> <args>` and returns stdout (free function; the
+/// hot-path log uses gix, but history/pickaxe lean on the CLI for `--follow`
+/// rename detection and pickaxe, which gix doesn't expose ergonomically).
+fn run_git(repo_dir: &str, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Parses `git log` records emitted with our unit-separated format
+/// (`%H \x1f %s \x1f %an \x1f %at \x1f %P`), one record per line.
+fn parse_log_records(out: &str) -> Vec<CommitInfo> {
+    out.lines()
+        .filter_map(|l| {
+            let mut f = l.split('\u{1f}');
+            let id = f.next()?.to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let summary = f.next().unwrap_or("").to_string();
+            let author = f.next().unwrap_or("").to_string();
+            let time = f.next().unwrap_or("0").trim().parse().unwrap_or(0);
+            let parents = f
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            Some(CommitInfo { id, summary, author, time, parents })
+        })
+        .collect()
+}
+
+const LOG_FMT: &str = "--pretty=tformat:%H%x1f%s%x1f%an%x1f%at%x1f%P";
+
+/// History of a single file: the commits that touched `path`, following
+/// renames (`git log --follow`). Newest first.
+pub fn file_history(repo_dir: &str, path: &str, limit: usize) -> Result<Vec<CommitInfo>, String> {
+    let lim = format!("-n{limit}");
+    let out = run_git(repo_dir, &["log", "--follow", &lim, LOG_FMT, "--", path])?;
+    Ok(parse_log_records(&out))
+}
+
+/// Pickaxe search across history: commits whose diff changes the number of
+/// occurrences of `term` (`-S`, literal), or — when `regex` — whose diff
+/// matches `term` as a regex (`-G`). Newest first.
+pub fn pickaxe(
+    repo_dir: &str,
+    term: &str,
+    regex: bool,
+    limit: usize,
+) -> Result<Vec<CommitInfo>, String> {
+    if term.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let lim = format!("-n{limit}");
+    let needle = if regex { format!("-G{term}") } else { format!("-S{term}") };
+    let out = run_git(repo_dir, &["log", &needle, &lim, LOG_FMT])?;
+    Ok(parse_log_records(&out))
 }
 
 /// Clones `url` into `dir` (via the `git` CLI, reusing the user's credentials).

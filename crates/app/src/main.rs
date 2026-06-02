@@ -6,6 +6,7 @@
 use git_core::blame::BlameLine;
 use git_core::diff::{FileDiff, LineOrigin};
 use git_core::graph::{compute_graph, EdgeKind, RowGraph};
+use git_core::syntax::{self, Lang};
 use git_core::rebase::{RebaseAction, RebaseResult, RebaseStep};
 use git_core::{
     AheadBehind, BranchInfo, CommitInfo, ConflictSides, RefKind, RefLabel, ReflogEntry, RemoteInfo,
@@ -46,6 +47,13 @@ mod color {
     pub fn ok() -> Rgba { rgb(0x59a869) }
     pub fn btn() -> Rgba { rgb(0x3c3f43) }
     pub fn tab_active() -> Rgba { rgb(0x1e1f22) }
+    // Syntax-highlight palette (New UI dark).
+    pub fn syn_kw() -> Rgba { rgb(0xcf8e6d) }   // keyword (orange)
+    pub fn syn_str() -> Rgba { rgb(0x6aab73) }  // string (green)
+    pub fn syn_num() -> Rgba { rgb(0x2aacb8) }  // number (teal)
+    pub fn syn_cmt() -> Rgba { rgb(0x7a7e85) }  // comment (gray)
+    pub fn syn_type() -> Rgba { rgb(0x9b86d6) } // type (purple)
+    pub fn syn_func() -> Rgba { rgb(0x57aaeb) } // function (blue)
 }
 
 /// Main app views (tabs + the "More" menu).
@@ -62,6 +70,29 @@ enum ViewMode {
     PullRequests,
     Console,
     Settings,
+    /// History of a single file (`git log --follow`).
+    FileHistory,
+    /// Pickaxe search across history (`git log -S`/`-G`).
+    Search,
+}
+
+/// What an ad-hoc [`CommitList`] represents (drives its header + diff scoping).
+#[derive(Clone)]
+enum ListKind {
+    /// Commits touching this file path (the diff is scoped to the file).
+    FileHistory(String),
+    /// Pickaxe search results (full commit diff shown).
+    Search,
+}
+
+/// A secondary commit list (file history or pickaxe search), shown above the
+/// shared diff panel. Independent from the main log selection.
+struct CommitList {
+    kind: ListKind,
+    label: String,
+    commits: Vec<CommitInfo>,
+    selected: Option<usize>,
+    msg: Option<String>,
 }
 
 /// A row of the interactive rebase editor.
@@ -162,7 +193,44 @@ enum DiffRow {
         /// `true` if this hunk comes from the staged (index) diff.
         staged: bool,
     },
-    Line(LineOrigin, String),
+    /// A diff line: origin (+/-/ctx), content, and the file's language (for syntax).
+    Line(LineOrigin, String, Lang),
+}
+
+/// Maps a syntax token kind to its color.
+fn tok_color(t: syntax::Tok) -> Rgba {
+    use syntax::Tok;
+    match t {
+        Tok::Text => color::fg(),
+        Tok::Keyword => color::syn_kw(),
+        Tok::Type => color::syn_type(),
+        Tok::Str => color::syn_str(),
+        Tok::Comment => color::syn_cmt(),
+        Tok::Number => color::syn_num(),
+        Tok::Func => color::syn_func(),
+    }
+}
+
+/// Renders one line of code as syntax-colored spans (a gap-free monospace row).
+/// With `on == false` or an unknown language, falls back to a single `fallback`-
+/// colored run (e.g. the add/del tint) so nothing is lost.
+fn line_spans(content: &str, lang: Lang, on: bool, fallback: Rgba) -> gpui::AnyElement {
+    if !on || lang == Lang::Plain {
+        return div()
+            .min_w_0()
+            .whitespace_nowrap()
+            .text_color(fallback)
+            .child(content.to_string())
+            .into_any_element();
+    }
+    let mut row = div().flex().flex_row().min_w_0().whitespace_nowrap();
+    for (kind, s) in syntax::highlight(content, lang) {
+        if s.is_empty() {
+            continue;
+        }
+        row = row.child(div().flex_none().text_color(tok_color(kind)).child(s));
+    }
+    row.into_any_element()
 }
 
 /// Flattens the diff (files→hunks→lines) into rows for the virtualized list.
@@ -179,9 +247,10 @@ fn build_diff_rows(diff: &[FileDiff]) -> Vec<DiffRow> {
 fn push_file_rows(rows: &mut Vec<DiffRow>, f: &FileDiff, staged: bool) {
     let (add, del) = f.line_stats();
     let bin = if f.binary { "  [binary]" } else { "" };
+    let lang = syntax::lang_for_path(&f.path);
     rows.push(DiffRow::File(
         f.path.clone(),
-        format!("{}   +{add} −{del}{bin}   ⟶ blame", f.path),
+        format!("{}   +{add} −{del}{bin}", f.path),
     ));
     for (i, h) in f.hunks.iter().enumerate() {
         rows.push(DiffRow::Hunk {
@@ -191,7 +260,7 @@ fn push_file_rows(rows: &mut Vec<DiffRow>, f: &FileDiff, staged: bool) {
             staged,
         });
         for l in &h.lines {
-            rows.push(DiffRow::Line(l.origin, l.content.clone()));
+            rows.push(DiffRow::Line(l.origin, l.content.clone(), lang));
         }
     }
 }
@@ -201,6 +270,7 @@ struct SideCell {
     lineno: Option<u32>,
     text: String,
     kind: LineOrigin,
+    lang: Lang,
 }
 
 /// A row of the side-by-side diff (file header, hunk header, or a left/right pair).
@@ -215,6 +285,7 @@ fn flush_side<'a>(
     rows: &mut Vec<SideRow>,
     dels: &mut Vec<&'a git_core::diff::DiffLine>,
     adds: &mut Vec<&'a git_core::diff::DiffLine>,
+    lang: Lang,
 ) {
     let n = dels.len().max(adds.len());
     for i in 0..n {
@@ -222,11 +293,13 @@ fn flush_side<'a>(
             lineno: d.old_lineno,
             text: d.content.clone(),
             kind: LineOrigin::Del,
+            lang,
         });
         let r = adds.get(i).map(|a| SideCell {
             lineno: a.new_lineno,
             text: a.content.clone(),
             kind: LineOrigin::Add,
+            lang,
         });
         rows.push(SideRow::Pair(l, r));
     }
@@ -239,6 +312,7 @@ fn build_side_rows(diff: &[FileDiff]) -> Vec<SideRow> {
     let mut rows = Vec::new();
     for f in diff {
         let (add, del) = f.line_stats();
+        let lang = syntax::lang_for_path(&f.path);
         rows.push(SideRow::File(format!("{}   +{add} −{del}", f.path)));
         for h in &f.hunks {
             rows.push(SideRow::Hunk(h.header.clone()));
@@ -247,17 +321,17 @@ fn build_side_rows(diff: &[FileDiff]) -> Vec<SideRow> {
             for l in &h.lines {
                 match l.origin {
                     LineOrigin::Context => {
-                        flush_side(&mut rows, &mut dels, &mut adds);
+                        flush_side(&mut rows, &mut dels, &mut adds, lang);
                         rows.push(SideRow::Pair(
-                            Some(SideCell { lineno: l.old_lineno, text: l.content.clone(), kind: LineOrigin::Context }),
-                            Some(SideCell { lineno: l.new_lineno, text: l.content.clone(), kind: LineOrigin::Context }),
+                            Some(SideCell { lineno: l.old_lineno, text: l.content.clone(), kind: LineOrigin::Context, lang }),
+                            Some(SideCell { lineno: l.new_lineno, text: l.content.clone(), kind: LineOrigin::Context, lang }),
                         ));
                     }
                     LineOrigin::Del => dels.push(l),
                     LineOrigin::Add => adds.push(l),
                 }
             }
-            flush_side(&mut rows, &mut dels, &mut adds);
+            flush_side(&mut rows, &mut dels, &mut adds, lang);
         }
     }
     rows
@@ -335,6 +409,8 @@ struct RebasedApp {
     diff_ignore_ws: bool,
     /// Side-by-side (two columns) vs unified diff.
     diff_side_by_side: bool,
+    /// Syntax-highlight diff/code lines.
+    diff_syntax: bool,
     /// Scroll handle for the commit-diff list (prev/next change navigation).
     diff_scroll: UniformListScrollHandle,
     /// Row index of the current change (for prev/next navigation).
@@ -369,6 +445,16 @@ struct RebasedApp {
     // ---- GitHub (via `gh`) ----
     prs: Vec<PrInfo>,
     prs_msg: Option<String>,
+
+    // ---- File history / pickaxe search ----
+    /// Ad-hoc commit list (file history or search) feeding the shared diff panel.
+    aux: Option<CommitList>,
+    /// Pickaxe search term + caret.
+    search_term: String,
+    search_focus: FocusHandle,
+    search_cursor: usize,
+    /// Treat the search term as a regex (`-G`) instead of a literal (`-S`).
+    search_regex: bool,
 
     /// Whether the commit-graph was refreshed for the current repo (once).
     graph_maintained: bool,
@@ -428,6 +514,9 @@ impl RebasedApp {
         self.rebase = None;
         self.op_msg = None;
         self.view = ViewMode::Log;
+        self.aux = None;
+        self.search_term.clear();
+        self.search_cursor = 0;
         self.graph_maintained = false;
 
         // Pre-warm the latest commit's diff and select it.
@@ -776,6 +865,183 @@ impl RebasedApp {
         cx.notify();
     }
 
+    // ---- File history & pickaxe search ----
+
+    /// Opens the file-history view for `path` (commits touching it, following
+    /// renames). Loads in the background; the diff panel scopes to the file.
+    fn show_file_history(&mut self, path: String, cx: &mut Context<Self>) {
+        self.view = ViewMode::FileHistory;
+        self.more_open = false;
+        self.blame = None;
+        self.op_msg = None;
+        self.aux = Some(CommitList {
+            kind: ListKind::FileHistory(path.clone()),
+            label: format!("History · {path}"),
+            commits: Vec::new(),
+            selected: None,
+            msg: Some("Loading history…".into()),
+        });
+        self.diff.clear();
+        self.diff_rows.clear();
+        self.diff_error = None;
+        cx.notify();
+
+        let repo = self.repo_path.clone();
+        cx.spawn(async move |this, cx| {
+            let p = path.clone();
+            let res = cx
+                .background_executor()
+                .spawn(async move { git_core::file_history(&repo, &p, 1000) })
+                .await;
+            let _ = this.update(cx, |t, cx| {
+                let still = matches!(&t.aux, Some(a) if matches!(&a.kind, ListKind::FileHistory(fp) if fp == &path));
+                if !still {
+                    return;
+                }
+                let aux = t.aux.as_mut().unwrap();
+                match res {
+                    Ok(commits) => {
+                        aux.msg = if commits.is_empty() {
+                            Some("No history for this file".into())
+                        } else {
+                            None
+                        };
+                        aux.commits = commits;
+                        aux.selected = None;
+                    }
+                    Err(e) => {
+                        aux.commits.clear();
+                        aux.msg = Some(format!("history: {}", first_line(&e)));
+                    }
+                }
+                if !t.aux.as_ref().unwrap().commits.is_empty() {
+                    t.aux_select(0, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Opens the pickaxe search view (preserving any prior results).
+    fn open_search(&mut self, cx: &mut Context<Self>) {
+        self.view = ViewMode::Search;
+        self.more_open = false;
+        self.op_msg = None;
+        let has_search = matches!(&self.aux, Some(a) if matches!(a.kind, ListKind::Search));
+        if !has_search {
+            self.aux = Some(CommitList {
+                kind: ListKind::Search,
+                label: "Search in changes".into(),
+                commits: Vec::new(),
+                selected: None,
+                msg: Some("Type a term and Run — finds commits whose diff adds/removes it.".into()),
+            });
+            self.diff.clear();
+            self.diff_rows.clear();
+            self.diff_error = None;
+        }
+        cx.notify();
+    }
+
+    /// Runs the pickaxe search over history (background).
+    fn run_search(&mut self, cx: &mut Context<Self>) {
+        let term = self.search_term.trim().to_string();
+        if term.is_empty() {
+            return;
+        }
+        let regex = self.search_regex;
+        self.aux = Some(CommitList {
+            kind: ListKind::Search,
+            label: format!("Search · {}{term}", if regex { "/" } else { "" }),
+            commits: Vec::new(),
+            selected: None,
+            msg: Some("Searching…".into()),
+        });
+        self.diff.clear();
+        self.diff_rows.clear();
+        self.diff_error = None;
+        cx.notify();
+
+        let repo = self.repo_path.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { git_core::pickaxe(&repo, &term, regex, 500) })
+                .await;
+            let _ = this.update(cx, |t, cx| {
+                let still = matches!(&t.aux, Some(a) if matches!(a.kind, ListKind::Search));
+                if !still {
+                    return;
+                }
+                let aux = t.aux.as_mut().unwrap();
+                match res {
+                    Ok(commits) => {
+                        aux.msg = if commits.is_empty() { Some("No matches".into()) } else { None };
+                        aux.commits = commits;
+                        aux.selected = None;
+                    }
+                    Err(e) => {
+                        aux.commits.clear();
+                        aux.msg = Some(format!("search: {}", first_line(&e)));
+                    }
+                }
+                if !t.aux.as_ref().unwrap().commits.is_empty() {
+                    t.aux_select(0, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Selects a commit in the ad-hoc list and loads its diff (scoped to the
+    /// file for file-history; full commit for search).
+    fn aux_select(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(aux) = &self.aux else { return };
+        let Some(c) = aux.commits.get(ix) else { return };
+        let id = c.id.clone();
+        let kind = aux.kind.clone();
+        if let Some(a) = self.aux.as_mut() {
+            a.selected = Some(ix);
+        }
+        self.blame = None;
+        match git_core::diff::commit_diff_ws(&self.repo_path, &id, self.diff_ignore_ws) {
+            Ok(mut files) => {
+                if let ListKind::FileHistory(path) = &kind {
+                    let scoped: Vec<FileDiff> = files
+                        .iter()
+                        .filter(|f| &f.path == path || f.old_path.as_deref() == Some(path.as_str()))
+                        .cloned()
+                        .collect();
+                    // Pre-rename commits carry the old name; if scoping empties the
+                    // diff, fall back to the whole commit rather than showing nothing.
+                    if !scoped.is_empty() {
+                        files = scoped;
+                    }
+                }
+                self.diff_rows = build_diff_rows(&files);
+                self.diff = files;
+                self.diff_error = None;
+            }
+            Err(e) => {
+                self.diff.clear();
+                self.diff_rows.clear();
+                self.diff_error = Some(e);
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_search_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        if ev.keystroke.key == "enter" {
+            self.run_search(cx);
+            return;
+        }
+        edit_key(&mut self.search_term, &mut self.search_cursor, ev, false);
+        cx.notify();
+    }
+
     // ---- View navigation ----
     fn set_view(&mut self, view: ViewMode, cx: &mut Context<Self>) {
         self.view = view;
@@ -793,7 +1059,10 @@ impl RebasedApp {
             ViewMode::Remotes => self.refresh_remotes(cx),
             ViewMode::Submodules => self.refresh_submodules(cx),
             ViewMode::PullRequests => self.refresh_prs(cx),
-            ViewMode::Log | ViewMode::Console | ViewMode::Settings => cx.notify(),
+            ViewMode::Search => self.open_search(cx),
+            ViewMode::Log | ViewMode::Console | ViewMode::Settings | ViewMode::FileHistory => {
+                cx.notify()
+            }
         }
     }
 
@@ -1221,6 +1490,11 @@ impl RebasedApp {
 
     fn toggle_side_by_side(&mut self, cx: &mut Context<Self>) {
         self.diff_side_by_side = !self.diff_side_by_side;
+        cx.notify();
+    }
+
+    fn toggle_syntax(&mut self, cx: &mut Context<Self>) {
+        self.diff_syntax = !self.diff_syntax;
         cx.notify();
     }
 
@@ -1780,6 +2054,8 @@ impl Render for RebasedApp {
                 ViewMode::PullRequests => self.render_prs(cx),
                 ViewMode::Console => self.render_console(cx),
                 ViewMode::Settings => self.render_settings(cx),
+                ViewMode::FileHistory => self.render_file_history(cx),
+                ViewMode::Search => self.render_search(cx),
             }
         };
         let overlays = self.render_overlays(cx);
@@ -2456,6 +2732,10 @@ impl RebasedApp {
                     let e = e.clone();
                     move |app| e.update(app, |t, cx| t.toggle_ignore_ws(cx))
                 }))
+                .child(btn("wt-syn", if self.diff_syntax { "Syntax ✓" } else { "Syntax" }, {
+                    let e = e.clone();
+                    move |app| e.update(app, |t, cx| t.toggle_syntax(cx))
+                }))
         });
 
         // working-tree diff of the selected file (virtualized)
@@ -2464,6 +2744,7 @@ impl RebasedApp {
         } else if self.diff_side_by_side {
             let rows = std::rc::Rc::new(build_side_rows(&self.wt_diff));
             let n = rows.len();
+            let syntax_on = self.diff_syntax;
             div()
                 .flex_1()
                 .min_h_0()
@@ -2473,7 +2754,7 @@ impl RebasedApp {
                     uniform_list("wt-side", n, {
                         let rows = rows.clone();
                         move |range: std::ops::Range<usize>, _w, _c| {
-                            range.filter_map(|i| rows.get(i).map(side_row_el)).collect::<Vec<_>>()
+                            range.filter_map(|i| rows.get(i).map(|r| side_row_el(r, syntax_on))).collect::<Vec<_>>()
                         }
                     })
                     .size_full(),
@@ -2493,9 +2774,10 @@ impl RebasedApp {
                         cx.processor({
                             let entity = e.clone();
                             move |this, range: std::ops::Range<usize>, _w, _c| {
+                                let syntax_on = this.diff_syntax;
                                 range
                                     .filter_map(|i| {
-                                        this.wt_rows.get(i).map(|row| wt_row_el(row, &entity))
+                                        this.wt_rows.get(i).map(|row| wt_row_el(row, &entity, syntax_on))
                                     })
                                     .collect::<Vec<_>>()
                             }
@@ -3106,6 +3388,171 @@ impl RebasedApp {
         titled("Pull requests", div().flex().flex_col().flex_1().min_h_0().child(list).child(footer).into_any_element())
     }
 
+    /// File-history view (commits touching one file) over the shared diff panel.
+    fn render_file_history(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        self.aux_list_view(cx, false)
+    }
+
+    /// Pickaxe search view (a term box + matching commits) over the diff panel.
+    fn render_search(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        self.aux_list_view(cx, true)
+    }
+
+    /// Shared layout for the ad-hoc commit lists (file history & search):
+    /// header · [search bar] · virtualized commit list · diff head · diff body.
+    fn aux_list_view(&self, cx: &mut Context<Self>, search: bool) -> gpui::AnyElement {
+        let e = cx.entity();
+        let label = self.aux.as_ref().map(|a| a.label.clone()).unwrap_or_default();
+        let n = self.aux.as_ref().map(|a| a.commits.len()).unwrap_or(0);
+        let msg = self.aux.as_ref().and_then(|a| a.msg.clone());
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_3()
+            .py_1()
+            .bg(color::panel())
+            .border_b_1()
+            .border_color(color::line())
+            .text_sm()
+            .child(btn("aux-back", "← Log", {
+                let e = e.clone();
+                move |app| e.update(app, |t, cx| t.set_view(ViewMode::Log, cx))
+            }))
+            .child(div().flex_1().min_w_0().whitespace_nowrap().text_ellipsis().text_color(color::accent()).child(label))
+            .child(div().flex_none().text_xs().text_color(color::dim()).child(format!("{n} commits")));
+
+        let search_bar = search.then(|| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .w_full()
+                .h(px(34.0))
+                .px_2()
+                .bg(color::panel())
+                .border_b_1()
+                .border_color(color::line())
+                .child(div().flex_none().text_color(color::dim()).text_sm().child("⌕"))
+                .child(
+                    div()
+                        .id("search-input")
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(24.0))
+                        .px_2()
+                        .bg(color::bg())
+                        .rounded_md()
+                        .border_1()
+                        .border_color(color::line())
+                        .track_focus(&self.search_focus)
+                        .key_context("search")
+                        .on_key_down(cx.listener(Self::on_search_key))
+                        .on_click(cx.listener(|t, _, w, _| w.focus(&t.search_focus)))
+                        .font_family("Menlo")
+                        .text_sm()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_color(if self.search_term.is_empty() { color::dim() } else { color::fg() })
+                        .child(if self.search_term.is_empty() {
+                            "Find commits that add/remove this text — Enter to run".to_string()
+                        } else {
+                            with_caret(&self.search_term, self.search_cursor)
+                        }),
+                )
+                .child(btn("search-regex", if self.search_regex { "regex ✓" } else { "regex" }, {
+                    let e = e.clone();
+                    move |app| e.update(app, |t, cx| { t.search_regex = !t.search_regex; cx.notify(); })
+                }))
+                .child(btn("search-run", "Run", {
+                    let e = e.clone();
+                    move |app| e.update(app, |t, cx| t.run_search(cx))
+                }))
+        });
+
+        let list_area = if n == 0 {
+            div()
+                .flex_none()
+                .h(px(220.0))
+                .p_3()
+                .text_color(color::dim())
+                .border_b_1()
+                .border_color(color::line())
+                .child(msg.unwrap_or_else(|| "—".into()))
+        } else {
+            let entity = e.clone();
+            div()
+                .flex_none()
+                .h(px(220.0))
+                .border_b_1()
+                .border_color(color::line())
+                .child(
+                    uniform_list(
+                        "aux-commits",
+                        n,
+                        cx.processor(move |this, range: std::ops::Range<usize>, _w, _c| {
+                            let Some(aux) = &this.aux else { return Vec::new() };
+                            range
+                                .filter_map(|ix| {
+                                    aux.commits.get(ix).map(|c| {
+                                        aux_commit_row(c, ix, aux.selected == Some(ix), entity.clone())
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .size_full(),
+                )
+        };
+
+        // Diff head: selected commit summary + the same toggles as the main panel.
+        let sel_summary = self
+            .aux
+            .as_ref()
+            .and_then(|a| a.selected.and_then(|i| a.commits.get(i)))
+            .map(|c| format!("{}  {}", c.id.get(..8).unwrap_or(&c.id), c.summary))
+            .unwrap_or_else(|| "Select a commit to view its diff".into());
+        let diff_head = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_3()
+            .py_1()
+            .bg(color::panel())
+            .border_t_1()
+            .border_color(color::line())
+            .text_sm()
+            .child(div().flex_1().min_w_0().whitespace_nowrap().text_ellipsis().font_family("Menlo").text_color(color::dim()).child(sel_summary))
+            .child(btn("aux-sbs", if self.diff_side_by_side { "Unified" } else { "Side-by-side" }, {
+                let e = e.clone();
+                move |app| e.update(app, |t, cx| t.toggle_side_by_side(cx))
+            }))
+            .child(btn("aux-syn", if self.diff_syntax { "Syntax ✓" } else { "Syntax" }, {
+                let e = e.clone();
+                move |app| e.update(app, |t, cx| t.toggle_syntax(cx))
+            }));
+
+        let body = self.diff_body(cx);
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(header)
+            .children(search_bar)
+            .child(list_area)
+            .child(diff_head)
+            .child(body)
+            .into_any_element()
+    }
+
     /// Built-in git console.
     fn render_console(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let lines: Vec<_> = self
@@ -3234,6 +3681,7 @@ impl RebasedApp {
             .child(nav("mv-reflog", "Reflog", ViewMode::Reflog))
             .child(nav("mv-remotes", "Remotes", ViewMode::Remotes))
             .child(nav("mv-subm", "Submodules", ViewMode::Submodules))
+            .child(nav("mv-search", "Search in changes", ViewMode::Search))
             .child(nav("mv-prs", "Pull requests", ViewMode::PullRequests))
             .child(nav("mv-console", "Git console", ViewMode::Console))
             .child(nav("mv-settings", "Settings", ViewMode::Settings));
@@ -3330,7 +3778,7 @@ fn btn(id: &str, label: &str, on: impl Fn(&mut App) + 'static) -> impl IntoEleme
 }
 
 /// Working-tree diff row, with per-hunk Stage/Unstage/Revert actions.
-fn wt_row_el(row: &DiffRow, entity: &Entity<RebasedApp>) -> gpui::AnyElement {
+fn wt_row_el(row: &DiffRow, entity: &Entity<RebasedApp>, syntax_on: bool) -> gpui::AnyElement {
     match row {
         DiffRow::File(_, label) => div()
             .flex()
@@ -3340,7 +3788,7 @@ fn wt_row_el(row: &DiffRow, entity: &Entity<RebasedApp>) -> gpui::AnyElement {
             .px_3()
             .bg(color::panel())
             .text_color(color::fg())
-            .child(label.replace("   ⟶ blame", ""))
+            .child(label.clone())
             .into_any_element(),
         DiffRow::Hunk { file, index, header, staged } => {
             let staged = *staged;
@@ -3399,7 +3847,7 @@ fn wt_row_el(row: &DiffRow, entity: &Entity<RebasedApp>) -> gpui::AnyElement {
             }
             r.into_any_element()
         }
-        DiffRow::Line(origin, content) => {
+        DiffRow::Line(origin, content, lang) => {
             let (fg, bg, sign) = match origin {
                 LineOrigin::Add => (color::add_fg(), color::add_bg(), "+"),
                 LineOrigin::Del => (color::del_fg(), color::del_bg(), "−"),
@@ -3407,14 +3855,14 @@ fn wt_row_el(row: &DiffRow, entity: &Entity<RebasedApp>) -> gpui::AnyElement {
             };
             div()
                 .flex()
+                .flex_row()
                 .items_center()
                 .h(px(DIFF_ROW_H))
                 .w_full()
                 .px_3()
                 .bg(bg)
-                .text_color(fg)
-                .whitespace_nowrap()
-                .child(format!("{sign} {content}"))
+                .child(div().flex_none().w(px(12.0)).text_color(fg).child(sign))
+                .child(line_spans(content, *lang, syntax_on, fg))
                 .into_any_element()
         }
     }
@@ -3514,6 +3962,10 @@ impl RebasedApp {
                         let e = cx.entity();
                         move |app| e.update(app, |t, cx| t.toggle_ignore_ws(cx))
                     }))
+                    .child(btn("d-syn", if self.diff_syntax { "Syntax ✓" } else { "Syntax" }, {
+                        let e = cx.entity();
+                        move |app| e.update(app, |t, cx| t.toggle_syntax(cx))
+                    }))
                     .child(btn("d-prev", "↑", {
                         let e = cx.entity();
                         move |app| e.update(app, |t, cx| t.diff_nav(false, cx))
@@ -3539,13 +3991,21 @@ impl RebasedApp {
                 .child("Select a commit to view its diff"),
         };
 
-        let body = if let Some(err) = &self.diff_error {
+        let body = self.diff_body(cx);
+        container.child(head).child(body).into_any_element()
+    }
+
+    /// The virtualized diff body (error / empty / side-by-side / unified).
+    /// Shared by the commit-diff panel and the file-history/search panels.
+    fn diff_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if let Some(err) = &self.diff_error {
             div().flex_1().p_3().text_color(color::err()).child(err.clone()).into_any_element()
         } else if self.diff_rows.is_empty() {
             div().flex_1().p_3().text_color(color::dim()).child("No changes in this commit").into_any_element()
         } else if self.diff_side_by_side {
             let rows = std::rc::Rc::new(build_side_rows(&self.diff));
             let n = rows.len();
+            let syntax_on = self.diff_syntax;
             div()
                 .flex_1()
                 .min_h_0()
@@ -3555,7 +4015,7 @@ impl RebasedApp {
                     uniform_list("side-rows", n, {
                         let rows = rows.clone();
                         move |range: std::ops::Range<usize>, _w, _cx| {
-                            range.filter_map(|i| rows.get(i).map(side_row_el)).collect::<Vec<_>>()
+                            range.filter_map(|i| rows.get(i).map(|r| side_row_el(r, syntax_on))).collect::<Vec<_>>()
                         }
                     })
                     .track_scroll(self.diff_scroll.clone())
@@ -3575,8 +4035,9 @@ impl RebasedApp {
                         "diff-rows",
                         n,
                         cx.processor(move |this, range: std::ops::Range<usize>, _w, _cx| {
+                            let syntax_on = this.diff_syntax;
                             range
-                                .filter_map(|i| this.diff_rows.get(i).map(|r| diff_row_el(r, &entity)))
+                                .filter_map(|i| this.diff_rows.get(i).map(|r| diff_row_el(r, &entity, syntax_on)))
                                 .collect::<Vec<_>>()
                         }),
                     )
@@ -3584,36 +4045,27 @@ impl RebasedApp {
                     .size_full(),
                 )
                 .into_any_element()
-        };
-
-        container.child(head).child(body).into_any_element()
+        }
     }
 }
 
-/// A virtualized diff row: file header (clickable→blame), hunk, or ± line.
-fn diff_row_el(row: &DiffRow, entity: &Entity<RebasedApp>) -> gpui::AnyElement {
+/// A virtualized diff row: file header (with blame/history actions), hunk, or ± line.
+fn diff_row_el(row: &DiffRow, entity: &Entity<RebasedApp>, syntax_on: bool) -> gpui::AnyElement {
     match row {
-        DiffRow::File(path, label) => {
-            let e = entity.clone();
-            let p = path.clone();
-            div()
-                .id(SharedString::from(format!("f:{path}")))
-                .flex()
-                .items_center()
-                .h(px(DIFF_ROW_H))
-                .w_full()
-                .px_3()
-                .bg(color::panel())
-                .text_color(color::fg())
-                .cursor_pointer()
-                .hover(|s| s.bg(color::hover()))
-                .on_click(move |_, _, app| {
-                    let p = p.clone();
-                    e.update(app, |t, cx| t.show_blame(p, cx));
-                })
-                .child(label.clone())
-                .into_any_element()
-        }
+        DiffRow::File(path, label) => div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(DIFF_ROW_H))
+            .w_full()
+            .px_3()
+            .bg(color::panel())
+            .text_color(color::fg())
+            .child(div().flex_1().min_w_0().whitespace_nowrap().text_ellipsis().child(label.clone()))
+            .child(file_action_chip("bl", path, "blame", entity.clone(), |t, p, cx| t.show_blame(p, cx)))
+            .child(file_action_chip("hi", path, "history", entity.clone(), |t, p, cx| t.show_file_history(p, cx)))
+            .into_any_element(),
         DiffRow::Hunk { header, .. } => div()
             .flex()
             .items_center()
@@ -3623,7 +4075,7 @@ fn diff_row_el(row: &DiffRow, entity: &Entity<RebasedApp>) -> gpui::AnyElement {
             .text_color(color::dim())
             .child(header.clone())
             .into_any_element(),
-        DiffRow::Line(origin, content) => {
+        DiffRow::Line(origin, content, lang) => {
             let (fg, bg, sign) = match origin {
                 LineOrigin::Add => (color::add_fg(), color::add_bg(), "+"),
                 LineOrigin::Del => (color::del_fg(), color::del_bg(), "−"),
@@ -3631,21 +4083,47 @@ fn diff_row_el(row: &DiffRow, entity: &Entity<RebasedApp>) -> gpui::AnyElement {
             };
             div()
                 .flex()
+                .flex_row()
                 .items_center()
                 .h(px(DIFF_ROW_H))
                 .w_full()
                 .px_3()
                 .bg(bg)
-                .text_color(fg)
-                .whitespace_nowrap()
-                .child(format!("{sign} {content}"))
+                .child(div().flex_none().w(px(12.0)).text_color(fg).child(sign))
+                .child(line_spans(content, *lang, syntax_on, fg))
                 .into_any_element()
         }
     }
 }
 
+/// A small clickable chip on a diff file header (e.g. "blame", "history").
+fn file_action_chip(
+    key: &str,
+    path: &str,
+    label: &'static str,
+    entity: Entity<RebasedApp>,
+    action: fn(&mut RebasedApp, String, &mut Context<RebasedApp>),
+) -> impl IntoElement {
+    let p = path.to_string();
+    div()
+        .id(SharedString::from(format!("{key}:{path}")))
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .bg(color::btn())
+        .cursor_pointer()
+        .text_xs()
+        .text_color(color::accent())
+        .hover(|s| s.bg(color::hover()))
+        .on_click(move |_, _, app| {
+            let p = p.clone();
+            entity.update(app, |t, cx| action(t, p, cx));
+        })
+        .child(label)
+}
+
 /// A side-by-side diff row: file header, hunk header, or a left/right pair.
-fn side_row_el(row: &SideRow) -> gpui::AnyElement {
+fn side_row_el(row: &SideRow, syntax_on: bool) -> gpui::AnyElement {
     match row {
         SideRow::File(label) => div()
             .flex()
@@ -3671,15 +4149,15 @@ fn side_row_el(row: &SideRow) -> gpui::AnyElement {
             .flex_row()
             .h(px(DIFF_ROW_H))
             .w_full()
-            .child(side_cell(l))
+            .child(side_cell(l, syntax_on))
             .child(div().flex_none().w(px(1.0)).h(px(DIFF_ROW_H)).bg(color::line()))
-            .child(side_cell(r))
+            .child(side_cell(r, syntax_on))
             .into_any_element(),
     }
 }
 
 /// One half of a side-by-side row (empty filler if `None`).
-fn side_cell(cell: &Option<SideCell>) -> gpui::AnyElement {
+fn side_cell(cell: &Option<SideCell>, syntax_on: bool) -> gpui::AnyElement {
     let Some(c) = cell else {
         return div().flex_1().min_w_0().h(px(DIFF_ROW_H)).bg(color::bg()).into_any_element();
     };
@@ -3706,7 +4184,7 @@ fn side_cell(cell: &Option<SideCell>) -> gpui::AnyElement {
                 .text_color(color::dim())
                 .child(c.lineno.map(|n| n.to_string()).unwrap_or_default()),
         )
-        .child(div().flex_1().min_w_0().whitespace_nowrap().child(c.text.clone()))
+        .child(line_spans(&c.text, c.lang, syntax_on, fg))
         .into_any_element()
 }
 
@@ -3827,6 +4305,41 @@ fn commit_row(
                 .text_sm()
                 .child(short_id),
         )
+}
+
+/// A commit row for the ad-hoc lists (file history / search): no graph gutter,
+/// clickable → loads that commit's diff into the shared panel.
+fn aux_commit_row(
+    c: &CommitInfo,
+    ix: usize,
+    selected: bool,
+    entity: Entity<RebasedApp>,
+) -> gpui::AnyElement {
+    let short = c.id.get(..8).unwrap_or(&c.id).to_string();
+    let mut row = div()
+        .id(ix)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .w_full()
+        .h(px(ROW_H))
+        .px_3()
+        .border_b_1()
+        .border_color(color::row_line())
+        .cursor_pointer()
+        .hover(|s| s.bg(color::hover()))
+        .on_click(move |_, _, app| {
+            entity.update(app, |t, cx| t.aux_select(ix, cx));
+        });
+    if selected {
+        row = row.bg(color::sel());
+    }
+    row.child(div().flex_1().min_w_0().whitespace_nowrap().text_ellipsis().text_color(color::fg()).child(truncate(&c.summary, 120)))
+        .child(div().flex_none().w(px(150.0)).whitespace_nowrap().text_ellipsis().text_color(color::dim()).text_sm().child(c.author.clone()))
+        .child(div().flex_none().w(px(88.0)).whitespace_nowrap().font_family("Menlo").text_color(color::dim()).text_sm().child(fmt_date(c.time)))
+        .child(div().flex_none().w(px(68.0)).whitespace_nowrap().font_family("Menlo").text_color(color::dim()).text_sm().child(short))
+        .into_any_element()
 }
 
 /// Graph gutter: a `canvas` painting vertical lines + merge/fork curves, with
@@ -3955,6 +4468,7 @@ fn main() {
                         filtered: Vec::new(),
                         diff_ignore_ws: false,
                         diff_side_by_side: false,
+                        diff_syntax: true,
                         diff_scroll: UniformListScrollHandle::new(),
                         diff_cursor: 0,
                         stashes: Vec::new(),
@@ -3977,6 +4491,11 @@ fn main() {
                         console_cursor: 0,
                         prs: Vec::new(),
                         prs_msg: None,
+                        aux: None,
+                        search_term: String::new(),
+                        search_focus: cx.focus_handle(),
+                        search_cursor: 0,
+                        search_regex: false,
                         graph_maintained: false,
                     };
                     if let Some(p) = initial {

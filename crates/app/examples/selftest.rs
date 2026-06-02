@@ -105,13 +105,14 @@ fn main() {
         Err(e) => println!("  ✗ FAILED: {e}"),
     }
 
-    println!("\n  -- PARITY: hunk staging / reset / tags / reflog / conflicts 3-way --");
-    let parity: [(&str, Result<String, String>); 5] = [
+    println!("\n  -- PARITY: hunk staging / reset / tags / reflog / conflicts / history+pickaxe --");
+    let parity: [(&str, Result<String, String>); 6] = [
         ("hunk staging", test_hunk_staging()),
         ("reset soft/hard", test_reset()),
         ("tags", test_tags()),
         ("reflog", test_reflog()),
         ("conflicts 3-way", test_conflicts()),
+        ("history + pickaxe", test_history_pickaxe()),
     ];
     for (name, r) in parity {
         match r {
@@ -167,6 +168,44 @@ fn test_hunk_staging() -> Result<String, String> {
         return Err(format!("partial stage failed (staged hunks={sh}, unstaged hunks={uh})"));
     }
     Ok(format!("staged 1 of 2 hunks (staged={sh}, remaining unstaged={uh})"))
+}
+
+/// File history (`--follow`) + pickaxe (`-S`): the file's commits are isolated
+/// from unrelated ones, and pickaxe pinpoints the commit that introduced a token.
+fn test_history_pickaxe() -> Result<String, String> {
+    let (repo, dir, path) = fresh_repo("diff-hist")?;
+    fs::write(dir.join("a.txt"), "alpha\n").map_err(|e| e.to_string())?;
+    repo.stage("a.txt").map_err(es)?;
+    repo.commit("add a").map_err(es)?;
+
+    fs::write(dir.join("a.txt"), "alpha\nUNIQUE_TOKEN\n").map_err(|e| e.to_string())?;
+    repo.stage("a.txt").map_err(es)?;
+    repo.commit("add token to a").map_err(es)?;
+
+    // Unrelated commit — must NOT show up in a.txt's history.
+    fs::write(dir.join("b.txt"), "beta\n").map_err(|e| e.to_string())?;
+    repo.stage("b.txt").map_err(es)?;
+    repo.commit("add b").map_err(es)?;
+
+    let hist = git_core::file_history(&path, "a.txt", 100)?;
+    if hist.len() != 2 {
+        return Err(format!("expected 2 commits in a.txt history, got {}", hist.len()));
+    }
+    if hist.iter().any(|c| c.summary == "add b") {
+        return Err("unrelated commit leaked into file history".into());
+    }
+
+    let hits = git_core::pickaxe(&path, "UNIQUE_TOKEN", false, 100)?;
+    if hits.len() != 1 || hits[0].summary != "add token to a" {
+        return Err(format!(
+            "pickaxe -S expected 1 hit, got {:?}",
+            hits.iter().map(|c| c.summary.clone()).collect::<Vec<_>>()
+        ));
+    }
+    if !git_core::pickaxe(&path, "NOT_PRESENT_ANYWHERE", false, 100)?.is_empty() {
+        return Err("pickaxe found a phantom match".into());
+    }
+    Ok(format!("history={} commits (isolated), pickaxe -S=1 hit", hist.len()))
 }
 
 /// reset --soft keeps changes staged; reset --hard discards them.
