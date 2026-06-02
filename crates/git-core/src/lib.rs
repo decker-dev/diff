@@ -255,6 +255,12 @@ impl Repo {
         Ok(oid.to_string())
     }
 
+    /// The configured author identity (name, email), if any.
+    pub fn user(&self) -> Option<(String, String)> {
+        let sig = self.inner.signature().ok()?;
+        Some((sig.name()?.to_string(), sig.email()?.to_string()))
+    }
+
     /// Amends the HEAD commit with the current index and a new message.
     pub fn amend(&self, message: &str) -> Result<String, Error> {
         let head = self.inner.head()?.peel_to_commit()?;
@@ -419,6 +425,11 @@ impl Repo {
         } else {
             Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
         }
+    }
+
+    /// Runs an arbitrary `git` subcommand (for the built-in console).
+    pub fn git(&self, args: &[&str]) -> Result<String, String> {
+        self.git_cli(args)
     }
 
     /// fetch from the given remote.
@@ -812,6 +823,17 @@ impl Repo {
     /// (unstage a hunk).
     pub fn apply_hunk_to_index(&self, file_patch: &str, reverse: bool) -> Result<(), String> {
         let mut args = vec!["apply", "--cached", "--whitespace=nowarn"];
+        if reverse {
+            args.push("--reverse");
+        }
+        args.push("-");
+        self.git_cli_stdin(&args, file_patch).map(|_| ())
+    }
+
+    /// Applies a single file patch to the working tree. With `reverse`, discards
+    /// the hunk (like `git checkout -p` / `git apply --reverse`).
+    pub fn apply_hunk_to_worktree(&self, file_patch: &str, reverse: bool) -> Result<(), String> {
+        let mut args = vec!["apply", "--whitespace=nowarn"];
         if reverse {
             args.push("--reverse");
         }
