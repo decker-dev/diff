@@ -1,10 +1,10 @@
-# rebased-rs vs Rebased (original, on IntelliJ/JVM)
+# diff vs Rebased (original, on IntelliJ/JVM)
 
 An honest comparison against the goal: **≥10x lighter and faster**.
 
 ## What was measured directly, and what wasn't
 
-- **rebased-rs**: measured on this machine (macOS arm64), release build, on the
+- **diff**: measured on this machine (macOS arm64), release build, on the
   505,988-commit test repo (`../rebased`).
 - **Original Rebased**: NOT installed, and building it is a huge JVM/Bazel build,
   so its numbers are the **typical/documented figures for IntelliJ-based apps**
@@ -15,7 +15,7 @@ An honest comparison against the goal: **≥10x lighter and faster**.
 
 ## Size and weight
 
-| Metric | rebased-rs | Rebased (typical JVM/IntelliJ) | Factor |
+| Metric | diff | Rebased (typical JVM/IntelliJ) | Factor |
 |---|---|---|---|
 | **Binary / distribution** | **7.8 MB** | 300 MB – 1 GB+ (bundles JBR/JVM) | **~40–130x lighter** ✅ |
 | **RAM** (50k commits + diff) | **~225 MB** | ~1–2 GB | **~5–9x lighter** ✅ |
@@ -25,7 +25,7 @@ An honest comparison against the goal: **≥10x lighter and faster**.
 
 ## Per-operation speed (measured vs `git` CLI)
 
-| Operation (505k-commit repo) | rebased-rs | git CLI | Verdict |
+| Operation (505k-commit repo) | diff | git CLI | Verdict |
 |---|---|---|---|
 | log 1,000 commits | 35 ms | 36 ms | tied |
 | log 50,000 commits | 245 ms | 379 ms | **1.5x faster than git** |

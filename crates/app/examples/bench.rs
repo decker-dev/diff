@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1000);
 
-    println!("== rebased-rs · engine benchmark ==");
+    println!("== diff · engine benchmark ==");
     println!("repo: {path}   limit: {limit}\n");
 
     let repo = git_core::Repo::open(&path)?;

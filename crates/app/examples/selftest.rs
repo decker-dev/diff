@@ -41,7 +41,7 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "/Users/decker/Documents/projects/diff/rebased".into());
 
-    println!("== rebased-rs · ENGINE SELF-TEST (release) ==");
+    println!("== diff · ENGINE SELF-TEST (release) ==");
     println!("repo: {repo}\n");
 
     // ---- History: log ----
@@ -108,7 +108,7 @@ fn main() {
 
 /// Checks stash (save→reverts, list, pop→reapplies) and ignore.
 fn test_stash_ignore() -> Result<String, String> {
-    let dir = std::env::temp_dir().join("rebased-rs-stash");
+    let dir = std::env::temp_dir().join("diff-stash");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.to_string_lossy().to_string();
@@ -152,8 +152,8 @@ fn test_stash_ignore() -> Result<String, String> {
 
 /// Checks push/remotes against a local bare remote (no network or auth).
 fn test_remote() -> Result<String, String> {
-    let bare = std::env::temp_dir().join("rebased-rs-remote.git");
-    let work = std::env::temp_dir().join("rebased-rs-remote-work");
+    let bare = std::env::temp_dir().join("diff-remote.git");
+    let work = std::env::temp_dir().join("diff-remote-work");
     let _ = fs::remove_dir_all(&bare);
     let _ = fs::remove_dir_all(&work);
     let bare_path = bare.to_string_lossy().to_string();
@@ -243,7 +243,7 @@ fn test_rebase() -> Result<String, String> {
     };
 
     // SQUASH: base A, pick B, squash C  →  A + (B+C)
-    let (repo, dir, a, b, c) = build_abc("rebased-rs-rb-sq")?;
+    let (repo, dir, a, b, c) = build_abc("diff-rb-sq")?;
     let res = repo
         .rebase_interactive(&a, &[step(&b, RebaseAction::Pick), step(&c, RebaseAction::Squash)])
         .map_err(es)?;
@@ -259,7 +259,7 @@ fn test_rebase() -> Result<String, String> {
     }
 
     // DROP: base A, pick B, drop C  →  A + B (no c.txt)
-    let (repo2, dir2, a2, b2, c2) = build_abc("rebased-rs-rb-dr")?;
+    let (repo2, dir2, a2, b2, c2) = build_abc("diff-rb-dr")?;
     let res2 = repo2
         .rebase_interactive(&a2, &[step(&b2, RebaseAction::Pick), step(&c2, RebaseAction::Drop)])
         .map_err(es)?;
@@ -276,7 +276,7 @@ fn test_rebase() -> Result<String, String> {
 
 /// Checks the branch cycle: create, checkout, commit, fast-forward merge, delete.
 fn test_branch_ops() -> Result<String, String> {
-    let dir = std::env::temp_dir().join("rebased-rs-branch");
+    let dir = std::env::temp_dir().join("diff-branch");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.to_string_lossy().to_string();
@@ -332,7 +332,7 @@ fn es(e: git_core::Error) -> String {
 
 /// Checks amend, cherry-pick and revert in a temp repo.
 fn test_commit_ops() -> Result<String, String> {
-    let dir = std::env::temp_dir().join("rebased-rs-ops");
+    let dir = std::env::temp_dir().join("diff-ops");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.to_string_lossy().to_string();
@@ -383,7 +383,7 @@ fn test_commit_ops() -> Result<String, String> {
 
 /// Creates a temp repo, stages+commits with git-core and verifies via the log.
 fn test_commit_cycle() -> Result<String, String> {
-    let dir = std::env::temp_dir().join("rebased-rs-selftest");
+    let dir = std::env::temp_dir().join("diff-selftest");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.to_string_lossy().to_string();

@@ -1,7 +1,7 @@
-//! rebased-rs — native window (GPUI): log graph + diff viewer.
+//! diff — native window (GPUI): log graph + diff viewer.
 //! M2: virtualized log + DAG.  M3: click a commit → diff below.
 //!
-//! Usage:  rebased-rs [repo-path] [limit]   (default: . and 50000)
+//! Usage:  diff [repo-path] [limit]   (default: . and 50000)
 
 use git_core::blame::BlameLine;
 use git_core::diff::{FileDiff, LineOrigin};
@@ -434,7 +434,7 @@ impl RebasedApp {
 
     fn do_stash(&mut self, cx: &mut Context<Self>) {
         let r = git_core::Repo::open(&self.repo_path)
-            .and_then(|mut repo| repo.stash_save("WIP (rebased-rs)"));
+            .and_then(|mut repo| repo.stash_save("WIP (diff)"));
         self.op_msg = Some(match r {
             Ok(id) => format!("✓ stash {}", short(&id)),
             Err(e) => format!("✗ {e}"),
@@ -652,7 +652,7 @@ impl RebasedApp {
             .bg(color::panel())
             .border_b_1()
             .border_color(color::line())
-            .child(div().px_2().text_color(color::accent()).child("rebased-rs"))
+            .child(div().px_2().text_color(color::accent()).child("diff"))
             .child(tab("Log", ViewMode::Log))
             .child(tab("Changes", ViewMode::Changes))
             .child(tab("Branches", ViewMode::Branches))

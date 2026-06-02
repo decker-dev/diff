@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "rebased-rs"
+name = "diff"
 path = "src/main.rs"
 
 [dependencies]

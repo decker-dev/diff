@@ -39,7 +39,7 @@ gate vs JVM Rebased is comfortably reachable.
 
 Native (Metal) window that loads the log with gix and renders it.
 
-| Metric | rebased-rs | Rebased / IntelliJ (typical) | Factor |
+| Metric | diff | Rebased / IntelliJ (typical) | Factor |
 |---|---|---|---|
 | **RSS (real RAM)** | **~85 MB** (window) / ~225 MB (50k loaded) | ~700 MB – 1.5 GB | **~5–12x lighter** |
 | **Binary size** | **7.8 MB** | 300 MB – 1 GB+ (bundles a JVM) | **~40–130x smaller** |
