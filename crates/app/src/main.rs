@@ -58,6 +58,7 @@ enum ViewMode {
     Reflog,
     Remotes,
     Submodules,
+    PullRequests,
     Console,
     Settings,
 }
@@ -87,6 +88,7 @@ struct Prompt {
     value: String,
     kind: PromptKind,
     focus: FocusHandle,
+    cursor: usize,
 }
 
 /// What a [`Prompt`] does on submit.
@@ -99,6 +101,16 @@ enum PromptKind {
     AddRemote,
     RenameBranch(String),
     SetUpstream(String),
+    Clone,
+}
+
+/// A GitHub pull request (via the `gh` CLI).
+struct PrInfo {
+    number: String,
+    title: String,
+    branch: String,
+    state: String,
+    author: String,
 }
 
 /// A small colored chip for a ref (branch/tag/HEAD) on a commit row.
@@ -342,6 +354,18 @@ struct RebasedApp {
     more_open: bool,
     /// Add a `Signed-off-by` trailer on commit.
     sign_off: bool,
+    /// In-progress op (rebase/merge/cherry-pick/revert) → action banner.
+    op_state: Option<String>,
+
+    // ---- Text-input caret positions (byte indices) ----
+    commit_cursor: usize,
+    branch_cursor: usize,
+    filter_cursor: usize,
+    console_cursor: usize,
+
+    // ---- GitHub (via `gh`) ----
+    prs: Vec<PrInfo>,
+    prs_msg: Option<String>,
 }
 
 impl RebasedApp {
@@ -381,6 +405,7 @@ impl RebasedApp {
         if let Ok(repo) = git_core::Repo::open(&path) {
             self.branches = repo.branches().unwrap_or_default();
             self.ahead_behind = repo.ahead_behind().ok();
+            self.op_state = repo.op_in_progress();
         }
 
         // Reset per-commit / per-view state.
@@ -511,6 +536,7 @@ impl RebasedApp {
             value: initial.to_string(),
             kind,
             focus: cx.focus_handle(),
+            cursor: initial.len(),
         });
         self.focus_prompt = true;
         self.menu = None;
@@ -536,7 +562,7 @@ impl RebasedApp {
             _ => {}
         }
         if let Some(p) = &mut self.prompt {
-            edit_key(&mut p.value, ev, false);
+            edit_key(&mut p.value, &mut p.cursor, ev, false);
         }
         cx.notify();
     }
@@ -593,6 +619,7 @@ impl RebasedApp {
                     .map(|_| format!("upstream {branch} → {v}"));
                 self.branch_op(r, cx);
             }
+            PromptKind::Clone => self.do_clone(v, cx),
         }
     }
 
@@ -648,8 +675,9 @@ impl RebasedApp {
         }
         if ev.keystroke.key == "escape" {
             self.log_filter.clear();
+            self.filter_cursor = 0;
         } else {
-            edit_key(&mut self.log_filter, ev, false);
+            edit_key(&mut self.log_filter, &mut self.filter_cursor, ev, false);
         }
         self.recompute_filter();
         cx.notify();
@@ -756,6 +784,7 @@ impl RebasedApp {
             ViewMode::Reflog => self.refresh_reflog(cx),
             ViewMode::Remotes => self.refresh_remotes(cx),
             ViewMode::Submodules => self.refresh_submodules(cx),
+            ViewMode::PullRequests => self.refresh_prs(cx),
             ViewMode::Log | ViewMode::Console | ViewMode::Settings => cx.notify(),
         }
     }
@@ -808,6 +837,9 @@ impl RebasedApp {
             self.conflict_file = self.conflicts.first().cloned();
         }
         self.load_conflict_sides();
+        self.op_state = git_core::Repo::open(&self.repo_path)
+            .ok()
+            .and_then(|r| r.op_in_progress());
         cx.notify();
     }
 
@@ -916,8 +948,114 @@ impl RebasedApp {
         self.console_output
             .push_str(&format!("$ git {}\n{}\n", args.join(" "), body.trim_end()));
         self.console_input.clear();
+        self.console_cursor = 0;
         self.reload_log();
         cx.notify();
+    }
+
+    // ---- GitHub (via `gh`) ----
+    fn refresh_prs(&mut self, cx: &mut Context<Self>) {
+        self.prs.clear();
+        self.prs_msg = Some("Loading pull requests…".into());
+        cx.notify();
+        let path = self.repo_path.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { git_core::gh_pr_list(&path) })
+                .await;
+            let _ = this.update(cx, |t, cx| {
+                match res {
+                    Ok(out) => {
+                        t.prs = out
+                            .lines()
+                            .filter_map(|l| {
+                                let mut f = l.split('\t');
+                                Some(PrInfo {
+                                    number: f.next()?.to_string(),
+                                    title: f.next().unwrap_or("").to_string(),
+                                    branch: f.next().unwrap_or("").to_string(),
+                                    state: f.next().unwrap_or("").to_string(),
+                                    author: f.next().unwrap_or("").to_string(),
+                                })
+                            })
+                            .collect();
+                        t.prs_msg = if t.prs.is_empty() {
+                            Some("No open pull requests".into())
+                        } else {
+                            None
+                        };
+                    }
+                    Err(e) => {
+                        t.prs.clear();
+                        t.prs_msg = Some(format!("gh: {e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn pr_action(&mut self, number: String, web: bool, cx: &mut Context<Self>) {
+        let path = self.repo_path.clone();
+        self.op_msg = Some(if web {
+            format!("opening PR #{number}…")
+        } else {
+            format!("checking out PR #{number}…")
+        });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    if web {
+                        git_core::gh_pr(&path, &["view", &number, "--web"])
+                    } else {
+                        git_core::gh_pr(&path, &["checkout", &number])
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |t, cx| {
+                t.op_msg = Some(match res {
+                    Ok(_) => "✓ done".into(),
+                    Err(e) => format!("✗ {}", first_line(&e)),
+                });
+                t.reload_log();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn do_clone(&mut self, spec: String, cx: &mut Context<Self>) {
+        let mut it = spec.split_whitespace();
+        let Some(url) = it.next().map(str::to_string) else { return };
+        let dir = it.next().map(str::to_string).unwrap_or_else(|| {
+            let name = url.rsplit('/').next().unwrap_or("repo").trim_end_matches(".git");
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            format!("{home}/{name}")
+        });
+        self.op_msg = Some(format!("cloning {url}…"));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let dir2 = dir.clone();
+            let res = cx
+                .background_executor()
+                .spawn(async move { git_core::clone_repo(&url, &dir2) })
+                .await;
+            let _ = this.update(cx, |t, cx| {
+                match res {
+                    Ok(d) => {
+                        t.op_msg = Some(format!("✓ cloned into {d}"));
+                        t.load_repo(&d);
+                    }
+                    Err(e) => t.op_msg = Some(format!("✗ clone: {}", first_line(&e))),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn on_console_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
@@ -925,7 +1063,7 @@ impl RebasedApp {
             self.run_console(cx);
             return;
         }
-        edit_key(&mut self.console_input, ev, false);
+        edit_key(&mut self.console_input, &mut self.console_cursor, ev, false);
         cx.notify();
     }
 
@@ -1118,6 +1256,7 @@ impl RebasedApp {
             Ok(id) => {
                 self.op_msg = Some(format!("✓ committed {}", short(&id)));
                 self.commit_msg.clear();
+                self.commit_cursor = 0;
                 self.reload_log();
             }
             Err(e) => self.op_msg = Some(format!("✗ {e}")),
@@ -1144,7 +1283,7 @@ impl RebasedApp {
     }
 
     fn on_commit_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
-        edit_key(&mut self.commit_msg, ev, true);
+        edit_key(&mut self.commit_msg, &mut self.commit_cursor, ev, true);
         cx.notify();
     }
 
@@ -1193,6 +1332,7 @@ impl RebasedApp {
             return;
         }
         self.new_branch.clear();
+        self.branch_cursor = 0;
         let r = git_core::Repo::open(&self.repo_path)
             .and_then(|repo| repo.create_branch(&name))
             .map(|_| format!("created {name}"));
@@ -1204,7 +1344,7 @@ impl RebasedApp {
             self.do_create_branch(cx);
             return;
         }
-        edit_key(&mut self.new_branch, ev, false);
+        edit_key(&mut self.new_branch, &mut self.branch_cursor, ev, false);
         cx.notify();
     }
 
@@ -1221,13 +1361,48 @@ impl RebasedApp {
                 .clamp(1, MAX_LANES);
             self.commits = commits;
         }
-        // Refresh ref chips + ahead/behind so the log and status bar stay current.
+        // Refresh ref chips + ahead/behind + in-progress op so the log,
+        // status bar and action banner stay current.
         self.refs = git_core::Repo::open(&self.repo_path)
             .and_then(|r| r.refs_by_commit())
             .unwrap_or_default();
         if let Ok(repo) = git_core::Repo::open(&self.repo_path) {
             self.ahead_behind = repo.ahead_behind().ok();
+            self.op_state = repo.op_in_progress();
         }
+    }
+
+    /// Continues/aborts/skips an in-progress rebase/merge/cherry-pick.
+    fn op_action(&mut self, which: &str, cx: &mut Context<Self>) {
+        let r = git_core::Repo::open(&self.repo_path)
+            .map_err(|e| e.to_string())
+            .and_then(|repo| match which {
+                "rcont" => repo.rebase_continue(),
+                "rabort" => repo.rebase_abort(),
+                "rskip" => repo.rebase_skip(),
+                "mabort" => repo.merge_abort(),
+                "cabort" => repo.cherry_pick_abort(),
+                _ => Ok(String::new()),
+            });
+        self.note(r.map(|o| {
+            let o = o.trim();
+            if o.is_empty() { "done".to_string() } else { first_line(o) }
+        }));
+        self.reload_log();
+        self.refresh_status(cx);
+        cx.notify();
+    }
+
+    /// Rebases the current branch onto another branch.
+    fn do_rebase_onto(&mut self, name: String, cx: &mut Context<Self>) {
+        let r = git_core::Repo::open(&self.repo_path).and_then(|repo| repo.rebase_onto(&name));
+        self.op_msg = Some(match r {
+            Ok(RebaseResult::Done(h)) => format!("✓ rebased onto {name} → {}", short(&h)),
+            Ok(RebaseResult::Conflict(c)) => format!("✗ conflict at {}", short(&c)),
+            Err(e) => format!("✗ {e}"),
+        });
+        self.reload_log();
+        cx.notify();
     }
 
     // ---- Remote (M7) / Stash (M8) ----
@@ -1292,13 +1467,24 @@ impl RebasedApp {
             cx.notify();
             return;
         };
+        // Autosquash: commits whose subject starts with fixup!/squash! are
+        // pre-marked accordingly (like `git rebase --autosquash`).
         let steps = self.commits[0..=ix]
             .iter()
             .rev()
-            .map(|c| PlanRow {
-                id: c.id.clone(),
-                summary: c.summary.clone(),
-                action: RebaseAction::Pick,
+            .map(|c| {
+                let action = if c.summary.starts_with("fixup!") {
+                    RebaseAction::Fixup
+                } else if c.summary.starts_with("squash!") {
+                    RebaseAction::Squash
+                } else {
+                    RebaseAction::Pick
+                };
+                PlanRow {
+                    id: c.id.clone(),
+                    summary: c.summary.clone(),
+                    action,
+                }
             })
             .collect();
         self.rebase = Some(RebasePlan { base, steps });
@@ -1365,27 +1551,99 @@ impl RebasedApp {
     }
 }
 
-/// Applies a key to a text buffer (minimal input).
-fn edit_key(buf: &mut String, ev: &KeyDownEvent, multiline: bool) {
+/// Applies a key to a text buffer with a caret at `cursor` (byte index).
+/// Supports left/right/home/end, backspace/delete, alt+backspace (delete word),
+/// and inserting typed characters mid-string.
+fn edit_key(buf: &mut String, cursor: &mut usize, ev: &KeyDownEvent, multiline: bool) {
+    let m = &ev.keystroke.modifiers;
+    *cursor = (*cursor).min(buf.len());
     match ev.keystroke.key.as_str() {
+        "left" => *cursor = prev_boundary(buf, *cursor),
+        "right" => *cursor = next_boundary(buf, *cursor),
+        "home" | "up" => *cursor = 0,
+        "end" | "down" => *cursor = buf.len(),
         "backspace" => {
-            buf.pop();
+            if m.alt || m.control {
+                let start = word_start(buf, *cursor);
+                buf.replace_range(start..*cursor, "");
+                *cursor = start;
+            } else if *cursor > 0 {
+                let p = prev_boundary(buf, *cursor);
+                buf.replace_range(p..*cursor, "");
+                *cursor = p;
+            }
+        }
+        "delete" => {
+            if *cursor < buf.len() {
+                let n = next_boundary(buf, *cursor);
+                buf.replace_range(*cursor..n, "");
+            }
         }
         "enter" => {
             if multiline {
-                buf.push('\n');
+                buf.insert(*cursor, '\n');
+                *cursor += 1;
             }
         }
-        "space" => buf.push(' '),
+        "space" => {
+            buf.insert(*cursor, ' ');
+            *cursor += 1;
+        }
         _ => {
             if let Some(c) = &ev.keystroke.key_char {
-                let m = &ev.keystroke.modifiers;
                 if !c.is_empty() && !m.platform && !m.control {
-                    buf.push_str(c);
+                    buf.insert_str(*cursor, c);
+                    *cursor += c.len();
                 }
             }
         }
     }
+}
+
+/// Previous char boundary before `i`.
+fn prev_boundary(s: &str, i: usize) -> usize {
+    if i == 0 {
+        return 0;
+    }
+    let mut j = i - 1;
+    while j > 0 && !s.is_char_boundary(j) {
+        j -= 1;
+    }
+    j
+}
+
+/// Next char boundary after `i`.
+fn next_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut j = i + 1;
+    while j < s.len() && !s.is_char_boundary(j) {
+        j += 1;
+    }
+    j
+}
+
+/// Start of the word before `i` (skips trailing spaces, then non-spaces).
+fn word_start(s: &str, i: usize) -> usize {
+    let b = s.as_bytes();
+    let mut j = i.min(s.len());
+    while j > 0 && b[j - 1] == b' ' {
+        j -= 1;
+    }
+    while j > 0 && b[j - 1] != b' ' {
+        j -= 1;
+    }
+    j
+}
+
+/// Renders text with a caret glyph at `cursor`.
+fn with_caret(text: &str, cursor: usize) -> String {
+    let mut c = cursor.min(text.len());
+    if !text.is_char_boundary(c) {
+        c = prev_boundary(text, c);
+    }
+    format!("{}▏{}", &text[..c], &text[c..])
 }
 
 fn first_line(s: &str) -> String {
@@ -1483,6 +1741,7 @@ impl Render for RebasedApp {
         }
 
         let toolbar = self.render_toolbar(cx);
+        let banner = self.render_op_banner(cx);
         let body = if self.rebase.is_some() {
             self.render_rebase_editor(cx)
         } else {
@@ -1495,6 +1754,7 @@ impl Render for RebasedApp {
                 ViewMode::Reflog => self.render_reflog(cx),
                 ViewMode::Remotes => self.render_remotes(cx),
                 ViewMode::Submodules => self.render_submodules(cx),
+                ViewMode::PullRequests => self.render_prs(cx),
                 ViewMode::Console => self.render_console(cx),
                 ViewMode::Settings => self.render_settings(cx),
             }
@@ -1520,6 +1780,7 @@ impl Render for RebasedApp {
             .bg(color::bg())
             .text_color(color::fg())
             .child(toolbar)
+            .children(banner)
             .child(body)
             .children(toast)
             .children(overlays)
@@ -1590,17 +1851,70 @@ impl RebasedApp {
             .child(div().text_color(color::accent()).text_2xl().child("⎇ diff"))
             .child(div().text_color(color::dim()).child("A fast, native git client"))
             .child(
-                div().mt_2().child(btn("welcome-open", "Open repository…", {
-                    let e = e.clone();
-                    move |app| {
-                        e.update(app, |t, cx| t.open_dialog(cx));
-                    }
-                })),
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .mt_2()
+                    .child(btn("welcome-open", "Open repository…", {
+                        let e = e.clone();
+                        move |app| {
+                            e.update(app, |t, cx| t.open_dialog(cx));
+                        }
+                    }))
+                    .child(btn("welcome-clone", "Clone from URL…", {
+                        let e = e.clone();
+                        move |app| {
+                            e.update(app, |t, cx| t.open_prompt("Clone: url [target-dir]", "", PromptKind::Clone, cx));
+                        }
+                    })),
             )
             .children(err)
             .child(div().mt_4().text_color(color::dim()).text_sm().child("Recent"))
             .child(recents)
             .into_any_element()
+    }
+
+    /// Banner shown while a rebase/merge/cherry-pick is in progress.
+    fn render_op_banner(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let op = self.op_state.clone()?;
+        let e = cx.entity();
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_3()
+            .py_1()
+            .bg(rgb(0x4a3a1f))
+            .border_b_1()
+            .border_color(rgb(0xe6c46a))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_color(rgb(0xe6c46a))
+                    .child(format!("⚠ {op} in progress — resolve conflicts, then continue")),
+            )
+            .child(btn("op-confl", "View conflicts", { let e = e.clone(); move |app| e.update(app, |t, cx| t.set_view(ViewMode::Conflicts, cx)) }));
+        match op.as_str() {
+            "rebase" => {
+                row = row
+                    .child(btn("op-cont", "Continue", { let e = e.clone(); move |app| e.update(app, |t, cx| t.op_action("rcont", cx)) }))
+                    .child(btn("op-skip", "Skip", { let e = e.clone(); move |app| e.update(app, |t, cx| t.op_action("rskip", cx)) }))
+                    .child(btn("op-abort", "Abort", { let e = e.clone(); move |app| e.update(app, |t, cx| t.op_action("rabort", cx)) }));
+            }
+            "merge" => {
+                row = row.child(btn("op-mabort", "Abort merge", { let e = e.clone(); move |app| e.update(app, |t, cx| t.op_action("mabort", cx)) }));
+            }
+            _ => {
+                row = row.child(btn("op-cabort", "Abort", { let e = e.clone(); move |app| e.update(app, |t, cx| t.op_action("cabort", cx)) }));
+            }
+        }
+        Some(row.into_any_element())
     }
 
     /// Floating overlays (commit context menu, modal prompt) drawn on top.
@@ -1757,7 +2071,7 @@ impl RebasedApp {
                     .child(if p.value.is_empty() {
                         "type…".to_string()
                     } else {
-                        format!("{}▏", p.value)
+                        with_caret(&p.value, p.cursor)
                     }),
             )
             .child(
@@ -1977,7 +2291,7 @@ impl RebasedApp {
                     .child(if self.log_filter.is_empty() {
                         "Filter by message / author / hash — Enter on a hash to jump".to_string()
                     } else {
-                        self.log_filter.clone()
+                        with_caret(&self.log_filter, self.filter_cursor)
                     }),
             )
             .child(
@@ -2148,7 +2462,7 @@ impl RebasedApp {
                     .child(if self.commit_msg.is_empty() {
                         "Commit message… (click to type)".to_string()
                     } else {
-                        self.commit_msg.clone()
+                        with_caret(&self.commit_msg, self.commit_cursor)
                     }),
             )
             .child(
@@ -2195,6 +2509,7 @@ impl RebasedApp {
             let (e3, n3) = (e.clone(), name.clone());
             let (e4, n4) = (e.clone(), name.clone());
             let (e5, n5) = (e.clone(), name.clone());
+            let (e6, n6) = (e.clone(), name.clone());
             let up_for_prompt = up.clone().unwrap_or_default();
             list = list.child(
                 div()
@@ -2219,6 +2534,7 @@ impl RebasedApp {
                     .child(div().flex_none().w(px(140.0)).whitespace_nowrap().text_ellipsis().text_xs().text_color(color::dim()).child(up.unwrap_or_default()))
                     .child(btn(&format!("co-{name}"), "checkout", move |app| { let n = n1.clone(); e1.update(app, |t, cx| t.do_checkout(n, cx)); }))
                     .child(btn(&format!("mg-{name}"), "merge", move |app| { let n = n2.clone(); e2.update(app, |t, cx| t.do_merge(n, cx)); }))
+                    .child(btn(&format!("ro-{name}"), "rebase onto", move |app| { let n = n6.clone(); e6.update(app, |t, cx| t.do_rebase_onto(n, cx)); }))
                     .child(btn(&format!("rn-{name}"), "rename", move |app| { let n = n4.clone(); e4.update(app, |t, cx| t.open_prompt("Rename branch", &n, PromptKind::RenameBranch(n.clone()), cx)); }))
                     .child(btn(&format!("up-{name}"), "upstream", move |app| { let (n, u) = (n5.clone(), up_for_prompt.clone()); e5.update(app, |t, cx| t.open_prompt("Set upstream (empty to unset)", &u, PromptKind::SetUpstream(n.clone()), cx)); }))
                     .child(btn(&format!("rm-{name}"), "delete", move |app| { let n = n3.clone(); e3.update(app, |t, cx| t.do_delete_branch(n, cx)); })),
@@ -2302,7 +2618,7 @@ impl RebasedApp {
                     .child(if self.new_branch.is_empty() {
                         "new branch… (Enter to create)".to_string()
                     } else {
-                        self.new_branch.clone()
+                        with_caret(&self.new_branch, self.branch_cursor)
                     }),
             )
             .child(btn("create-br", "Create", { let e = e.clone(); move |app| { e.update(app, |t, cx| t.do_create_branch(cx)); } }));
@@ -2636,7 +2952,12 @@ impl RebasedApp {
             .border_color(color::line())
             .bg(color::panel())
             .child(btn("add-remote", "Add remote…", { let e = e.clone(); move |app| e.update(app, |t, cx| t.open_prompt("Add remote: name url", "origin ", PromptKind::AddRemote, cx)) }))
-            .child(btn("fetch-all", "Fetch all (prune)", { let e = e.clone(); move |app| e.update(app, |t, cx| t.run_remote("fetchall", cx)) }));
+            .child(btn("fetch-all", "Fetch all (prune)", { let e = e.clone(); move |app| e.update(app, |t, cx| t.run_remote("fetchall", cx)) }))
+            .child(btn("pull-r", "Pull --rebase", { let e = e.clone(); move |app| e.update(app, |t, cx| t.run_remote("pullrebase", cx)) }))
+            .child(btn("pull-m", "Pull --merge", { let e = e.clone(); move |app| e.update(app, |t, cx| t.run_remote("pullmerge", cx)) }))
+            .child(btn("push-f", "Push --force-with-lease", { let e = e.clone(); move |app| e.update(app, |t, cx| t.run_remote("pushforce", cx)) }))
+            .child(btn("push-u", "Push -u", { let e = e.clone(); move |app| e.update(app, |t, cx| t.run_remote("pushupstream", cx)) }))
+            .child(btn("push-t", "Push --tags", { let e = e.clone(); move |app| e.update(app, |t, cx| t.run_remote("pushtags", cx)) }));
         titled("Remotes", div().flex().flex_col().flex_1().min_h_0().child(list).child(footer).into_any_element())
     }
 
@@ -2662,6 +2983,52 @@ impl RebasedApp {
             );
         }
         titled("Submodules", list.into_any_element())
+    }
+
+    /// GitHub pull requests (via the `gh` CLI).
+    fn render_prs(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let e = cx.entity();
+        let mut list = div().id("prs-list").flex().flex_col().flex_1().min_h_0().overflow_y_scroll();
+        if let Some(m) = &self.prs_msg {
+            list = list.child(div().p_3().text_color(color::dim()).child(m.clone()));
+        }
+        for p in &self.prs {
+            let num = p.number.clone();
+            let (e1, n1) = (e.clone(), num.clone());
+            let (e2, n2) = (e.clone(), num.clone());
+            let state_col = if p.state == "OPEN" { color::ok() } else { color::dim() };
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .h(px(32.0))
+                    .hover(|s| s.bg(color::hover()))
+                    .child(div().flex_none().w(px(48.0)).font_family("Menlo").text_color(color::accent()).child(format!("#{num}")))
+                    .child(div().flex_1().min_w_0().whitespace_nowrap().text_ellipsis().text_color(color::fg()).child(p.title.clone()))
+                    .child(div().flex_none().w(px(150.0)).whitespace_nowrap().text_ellipsis().text_xs().text_color(color::dim()).child(p.branch.clone()))
+                    .child(div().flex_none().w(px(90.0)).whitespace_nowrap().text_ellipsis().text_xs().text_color(color::dim()).child(p.author.clone()))
+                    .child(div().flex_none().w(px(56.0)).text_xs().text_color(state_col).child(p.state.clone()))
+                    .child(btn(&format!("pr-co-{num}"), "checkout", move |app| { let n = n1.clone(); e1.update(app, |t, cx| t.pr_action(n, false, cx)); }))
+                    .child(btn(&format!("pr-web-{num}"), "web", move |app| { let n = n2.clone(); e2.update(app, |t, cx| t.pr_action(n, true, cx)); })),
+            );
+        }
+        let footer = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .p_2()
+            .border_t_1()
+            .border_color(color::line())
+            .bg(color::panel())
+            .child(btn("pr-refresh", "Refresh", { let e = e.clone(); move |app| e.update(app, |t, cx| t.refresh_prs(cx)) }))
+            .child(div().flex_1())
+            .child(div().text_xs().text_color(color::dim()).child("via gh CLI"));
+        titled("Pull requests", div().flex().flex_col().flex_1().min_h_0().child(list).child(footer).into_any_element())
     }
 
     /// Built-in git console.
@@ -2721,7 +3088,7 @@ impl RebasedApp {
                     .child(if self.console_input.is_empty() {
                         "status · log --oneline -5 · diff --stat …".to_string()
                     } else {
-                        self.console_input.clone()
+                        with_caret(&self.console_input, self.console_cursor)
                     }),
             )
             .child(btn("console-run", "Run", { let e = cx.entity(); move |app| e.update(app, |t, cx| t.run_console(cx)) }));
@@ -2792,6 +3159,7 @@ impl RebasedApp {
             .child(nav("mv-reflog", "Reflog", ViewMode::Reflog))
             .child(nav("mv-remotes", "Remotes", ViewMode::Remotes))
             .child(nav("mv-subm", "Submodules", ViewMode::Submodules))
+            .child(nav("mv-prs", "Pull requests", ViewMode::PullRequests))
             .child(nav("mv-console", "Git console", ViewMode::Console))
             .child(nav("mv-settings", "Settings", ViewMode::Settings));
         let backdrop = div()
@@ -3496,6 +3864,13 @@ fn main() {
                         console_output: String::new(),
                         more_open: false,
                         sign_off: false,
+                        op_state: None,
+                        commit_cursor: 0,
+                        branch_cursor: 0,
+                        filter_cursor: 0,
+                        console_cursor: 0,
+                        prs: Vec::new(),
+                        prs_msg: None,
                     };
                     if let Some(p) = initial {
                         app.load_repo(&p);
