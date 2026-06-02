@@ -399,6 +399,38 @@ impl Repo {
         rebase::rebase_onto(&self.inner, upstream)
     }
 
+    /// Detects an in-progress operation that may need abort/continue/skip.
+    pub fn op_in_progress(&self) -> Option<String> {
+        let gd = self.inner.path();
+        if gd.join("rebase-merge").exists() || gd.join("rebase-apply").exists() {
+            Some("rebase".into())
+        } else if gd.join("MERGE_HEAD").exists() {
+            Some("merge".into())
+        } else if gd.join("CHERRY_PICK_HEAD").exists() {
+            Some("cherry-pick".into())
+        } else if gd.join("REVERT_HEAD").exists() {
+            Some("revert".into())
+        } else {
+            None
+        }
+    }
+
+    pub fn rebase_continue(&self) -> Result<String, String> {
+        self.git_cli(&["-c", "core.editor=true", "rebase", "--continue"])
+    }
+    pub fn rebase_abort(&self) -> Result<String, String> {
+        self.git_cli(&["rebase", "--abort"])
+    }
+    pub fn rebase_skip(&self) -> Result<String, String> {
+        self.git_cli(&["rebase", "--skip"])
+    }
+    pub fn merge_abort(&self) -> Result<String, String> {
+        self.git_cli(&["merge", "--abort"])
+    }
+    pub fn cherry_pick_abort(&self) -> Result<String, String> {
+        self.git_cli(&["cherry-pick", "--abort"])
+    }
+
     // ---- Remote ----
 
     /// Lists the configured remotes.
@@ -869,6 +901,59 @@ impl Repo {
         } else {
             Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
         }
+    }
+}
+
+/// Clones `url` into `dir` (via the `git` CLI, reusing the user's credentials).
+pub fn clone_repo(url: &str, dir: &str) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .args(["clone", url, dir])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(dir.to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Lists pull requests via the `gh` CLI (tab-separated: number, title, branch,
+/// state). Returns an error string if `gh` is missing or not authenticated.
+pub fn gh_pr_list(repo_dir: &str) -> Result<String, String> {
+    let out = std::process::Command::new("gh")
+        .arg("-C")
+        .arg(repo_dir)
+        .args([
+            "pr",
+            "list",
+            "--limit",
+            "50",
+            "--json",
+            "number,title,headRefName,state,author",
+            "--template",
+            "{{range .}}{{.number}}\t{{.title}}\t{{.headRefName}}\t{{.state}}\t{{.author.login}}\n{{end}}",
+        ])
+        .output()
+        .map_err(|e| format!("gh not found: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Runs a `gh pr <args>` subcommand in `repo_dir` (checkout, view --web, …).
+pub fn gh_pr(repo_dir: &str, args: &[&str]) -> Result<String, String> {
+    let mut a = vec!["-C", repo_dir, "pr"];
+    a.extend_from_slice(args);
+    let out = std::process::Command::new("gh")
+        .args(&a)
+        .output()
+        .map_err(|e| format!("gh not found: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
 }
 
