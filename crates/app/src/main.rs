@@ -13,10 +13,11 @@ use git_core::{
     ReflogEntry, RemoteInfo, StashInfo, StatusEntry, SubmoduleInfo, TagInfo,
 };
 use gpui::{
-    canvas, div, point, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds,
-    ClipboardItem, Context, Entity, FocusHandle, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem,
+    canvas, div, list, point, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds,
+    ClipboardItem, Context, Entity, FocusHandle, Hsla, KeyBinding, KeyDownEvent, ListAlignment,
+    ListState, Menu, MenuItem,
     MouseButton, OsAction, PathBuilder, PathPromptOptions, Rgba, ScrollStrategy, SharedString,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use std::collections::HashMap;
 
@@ -641,6 +642,9 @@ struct RebasedApp {
     prs_msg: Option<String>,
     /// Open PR review session (None = show the PR list).
     pr_view: Option<PrView>,
+    /// Virtualized scroll state for the PR review rows (variable-height `list`).
+    /// Recreated when a PR finishes loading; `None` while loading or closed.
+    pr_rows_state: Option<ListState>,
     /// Inline comment composer: target + buffer + caret.
     pr_compose_target: Option<ComposeTarget>,
     pr_compose: String,
@@ -1519,6 +1523,7 @@ impl RebasedApp {
         self.op_msg = None;
         self.pr_compose_target = None;
         self.pr_compose.clear();
+        self.pr_rows_state = None;
         self.pr_view = Some(PrView {
             detail: PrDetail { number: number.clone(), ..Default::default() },
             rows: Vec::new(),
@@ -1529,26 +1534,52 @@ impl RebasedApp {
 
         let repo = self.repo_path.clone();
         cx.spawn(async move |this, cx| {
-            let num = number.clone();
-            let res = cx
-                .background_executor()
-                .spawn(async move {
-                    let detail = git_core::gh_pr_detail(&repo, &num)?;
-                    let diff_text = git_core::gh_pr_diff(&repo, &num).unwrap_or_default();
-                    let diff = git_core::diff::parse_unified_diff(&diff_text);
-                    let comments = git_core::gh_pr_review_comments(&repo, &num).unwrap_or_default();
-                    let conversation = git_core::gh_pr_conversation(&repo, &num).unwrap_or_default();
-                    Ok::<_, String>((detail, diff, comments, conversation))
+            // The four loads are independent and read-only, so fire them all at
+            // once: each `spawn` starts immediately on the background pool, so
+            // total time drops from the sum of the `gh` round-trips to just the
+            // slowest single one.
+            let bg = cx.background_executor();
+            let detail_t = {
+                let (repo, num) = (repo.clone(), number.clone());
+                bg.spawn(async move { git_core::gh_pr_detail(&repo, &num) })
+            };
+            let diff_t = {
+                let (repo, num) = (repo.clone(), number.clone());
+                bg.spawn(async move {
+                    let text = git_core::gh_pr_diff(&repo, &num).unwrap_or_default();
+                    git_core::diff::parse_unified_diff(&text)
                 })
+            };
+            let comments_t = {
+                let (repo, num) = (repo.clone(), number.clone());
+                bg.spawn(async move { git_core::gh_pr_review_comments(&repo, &num).unwrap_or_default() })
+            };
+            let conv_t = {
+                let (repo, num) = (repo.clone(), number.clone());
+                bg.spawn(async move { git_core::gh_pr_conversation(&repo, &num).unwrap_or_default() })
+            };
+            let detail = detail_t.await;
+            let diff = diff_t.await;
+            let comments = comments_t.await;
+            let conversation = conv_t.await;
+            // Flatten diff + comments into rows off the UI thread too: on a huge
+            // PR this is O(thousands) and must not stall the first render.
+            let rows = cx
+                .background_executor()
+                .spawn(async move { build_pr_rows(&diff, &comments, &conversation) })
                 .await;
+
             let _ = this.update(cx, |t, cx| {
                 let still = matches!(&t.pr_view, Some(v) if v.detail.number == number);
                 if !still {
                     return;
                 }
-                match res {
-                    Ok((detail, diff, comments, conversation)) => {
-                        let rows = build_pr_rows(&diff, &comments, &conversation);
+                match detail {
+                    Ok(detail) => {
+                        // Point the virtualized list at the new row count: only
+                        // visible rows get measured/painted, whatever the size.
+                        t.pr_rows_state =
+                            Some(ListState::new(rows.len(), ListAlignment::Top, px(256.0)));
                         t.pr_view = Some(PrView { detail, rows, loading: false, error: None });
                     }
                     Err(e) => {
@@ -1567,6 +1598,7 @@ impl RebasedApp {
     /// Closes the PR review session, back to the PR list.
     fn close_pr(&mut self, cx: &mut Context<Self>) {
         self.pr_view = None;
+        self.pr_rows_state = None;
         self.pr_compose_target = None;
         self.pr_compose.clear();
         cx.notify();
@@ -3856,28 +3888,28 @@ impl RebasedApp {
                 }
                 col
             });
-            // Comment cards have variable height, so this list is a plain
-            // scroll column (not uniform_list). PR diffs are bounded; we cap
-            // rendered rows for safety and note any truncation.
-            const CAP: usize = 4000;
-            let mut list = div()
-                .id("pr-rows")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .font_family("Menlo")
-                .text_xs();
-            for r in v.rows.iter().take(CAP) {
-                list = list.child(pr_row_el(r, &entity, syntax_on));
-            }
-            if v.rows.len() > CAP {
-                list = list.child(
-                    div().p_2().text_color(color::dim()).child(format!("… {} more rows (truncated)", v.rows.len() - CAP)),
-                );
-            }
-            div().flex().flex_col().flex_1().min_h_0().children(desc).child(list).into_any_element()
+            // Comment cards have variable height, so we virtualize with `list`
+            // (not `uniform_list`): only the rows in (or near) view are built and
+            // measured, so a PR with thousands of diff lines renders as cheaply
+            // as a tiny one. Scroll state lives on the view, in `pr_rows_state`.
+            let rows_el: gpui::AnyElement = match self.pr_rows_state.clone() {
+                Some(state) => {
+                    let row_entity = entity.clone();
+                    list(state, move |ix, _win, app| {
+                        match row_entity.read(app).pr_view.as_ref().and_then(|v| v.rows.get(ix)) {
+                            Some(r) => pr_row_el(r, &row_entity, syntax_on),
+                            None => div().into_any_element(),
+                        }
+                    })
+                    .flex_1()
+                    .min_h_0()
+                    .font_family("Menlo")
+                    .text_xs()
+                    .into_any_element()
+                }
+                None => div().flex_1().min_h_0().into_any_element(),
+            };
+            div().flex().flex_col().flex_1().min_h_0().children(desc).child(rows_el).into_any_element()
         };
 
         let composer = self.pr_compose_target.as_ref().map(|target| {
@@ -5113,6 +5145,11 @@ fn main() {
             .open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("diff".into()),
+                    appears_transparent: false,
+                    traffic_light_position: None,
+                }),
                 ..Default::default()
             },
             move |_, cx| {
@@ -5180,6 +5217,7 @@ fn main() {
                         prs: Vec::new(),
                         prs_msg: None,
                         pr_view: None,
+                        pr_rows_state: None,
                         pr_compose_target: None,
                         pr_compose: String::new(),
                         pr_compose_focus: cx.focus_handle(),
